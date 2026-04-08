@@ -9,6 +9,8 @@ pub mod dal;
 pub mod migrations;
 pub mod roles;
 
+use saps_frontend_macro::mount_frontend;
+
 async fn health() -> impl IntoResponse {
     "OK"
 }
@@ -19,8 +21,7 @@ async fn main() {
 
     let app = api::networking::users::users_factory::<EnvConfig>(app);
 
-    #[cfg(feature = "embed")]
-    let app = ingress::attach_embedded_frontend(app);
+    mount_frontend!("frontend/web/public", app);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await

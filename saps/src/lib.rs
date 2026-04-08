@@ -11,6 +11,8 @@ mod constants;
 // re-exports
 pub use axum;
 pub use sqlx;
+pub use mime_guess;
+pub use rust_embed;
 
 // macros
 pub use saps_db_pool_macro::define_pg_pool;
