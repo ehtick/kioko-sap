@@ -137,7 +137,6 @@ dependencies = [
  "include_dir",
  "rand 0.10.0",
  "saps",
- "saps-frontend-macro",
  "serde",
  "serde_json",
  "sqlx",
@@ -1643,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "saps"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64",
@@ -1657,6 +1656,7 @@ dependencies = [
  "rust-embed",
  "saps-db-pool-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-tx 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "saps-frontend-macro 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-test-macro 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
@@ -1714,6 +1714,17 @@ dependencies = [
 [[package]]
 name = "saps-frontend-macro"
 version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "saps-frontend-macro"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ff2b9784ad0615af920579bed795d219f90758007f6dfbc6cc850d730b795b"
 dependencies = [
  "proc-macro2",
  "quote",

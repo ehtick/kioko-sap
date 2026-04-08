@@ -1,15 +1,12 @@
 use saps::axum::{Router, response::IntoResponse, routing::get};
 use saps::config::EnvConfig;
 
-#[cfg(feature = "embed")]
-mod ingress;
-
 mod api;
 pub mod dal;
 pub mod migrations;
 pub mod roles;
 
-use saps_frontend_macro::mount_frontend;
+use saps::mount_frontend;
 
 async fn health() -> impl IntoResponse {
     "OK"

@@ -1,6 +1,6 @@
 [package]
 name = "saps"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Core library for the SAP framework"
 license = "MIT"
@@ -22,10 +22,11 @@ rmp-serde = { workspace = true }
 paste = { workspace = true }
 base64 = { workspace = true }
 
+# macros
 saps-db-pool-macro = "0.1.1"
 saps-db-tx = "0.1.1"
 saps-test-macro = "0.1.2"
-
+saps-frontend-macro = "0.1.0"
 
 [dev-dependencies]
 http-body-util = { workspace = true }
