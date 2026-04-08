@@ -1,0 +1,32 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Vite `build.outDir` (`vite.config.ts` → `public/`): keep layout, ignore generated bundles
+public/bundle.js
+public/bundle.css
+public/bundle.js.map
+public/chunk-*.js
+public/assets/*
+!public/assets/.gitkeep
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

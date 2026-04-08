@@ -21,3 +21,9 @@ target
 .idea/
 
 .DS_Store
+
+# Cursor IDE
+.cursor/
+
+# Storybook scaffold (TMPDIR under frontend/web; avoids EXDEV on storybook init)
+.tmp/
