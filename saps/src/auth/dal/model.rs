@@ -94,6 +94,22 @@ BEGIN
         RETURN NULL;
     END IF;
 
+    -- If date_created is older than 5 minutes, regenerate UUID and reset date_created
+    UPDATE saps.auth_sessions
+    SET id = gen_random_uuid(),
+        date_created = NOW(),
+        last_interacted = NOW()
+    WHERE id = p_session_id
+      AND date_created < NOW() - INTERVAL '5 minutes'
+    RETURNING * INTO session_record;
+
+    GET DIAGNOSTICS rows_affected = ROW_COUNT;
+
+    IF rows_affected > 0 THEN
+        RETURN session_record;
+    END IF;
+
+    -- Otherwise just update last_interacted
     UPDATE saps.auth_sessions
     SET last_interacted = NOW()
     WHERE id = p_session_id

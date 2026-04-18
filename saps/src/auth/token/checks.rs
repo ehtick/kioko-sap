@@ -2,7 +2,7 @@
 //!
 //! This module provides a trait-based system for validating whether a user's role has
 //! sufficient permissions to perform a given action. You define your roles as enum variants
-//! inside the [`construct_checks!`] macro, and it generates:
+//! inside the `construct_checks!` macro, and it generates:
 //!
 //! 1. The role enum itself (with `Clone`, `Debug` derived)
 //! 2. `ToString` impl — converts each variant to its lowercased name (e.g. `SuperAdmin` → `"superadmin"`)
@@ -73,7 +73,7 @@ use crate::errors::saps::SapsError;
 /// user's role to get `Ok(())` if access is granted, or a `SapsError` with
 /// `Unauthorized` status if denied.
 ///
-/// You typically don't implement this trait manually — instead, use the [`construct_checks!`]
+/// You typically don't implement this trait manually — instead, use the `construct_checks!`
 /// macro to generate check structs declaratively.
 pub trait CheckUserRole {
     fn check_user_role<U: UserRole>(role: &U) -> Result<(), SapsError>;
@@ -90,7 +90,7 @@ pub trait CheckUserRole {
 /// The trait itself has no methods — it serves as a marker that ties together the
 /// string conversion capabilities needed by the check system.
 ///
-/// When using [`construct_checks!`] with an enum definition, all three impls (`ToString`,
+/// When using `construct_checks!` with an enum definition, all three impls (`ToString`,
 /// `TryFrom<String>`, and `UserRole`) are generated automatically.
 pub trait UserRole: ToString + TryFrom<String, Error = SapsError> + Send + Unpin + Serialize + DeserializeOwned {}
 
