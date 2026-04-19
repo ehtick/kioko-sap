@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: saps_worker
+      POSTGRES_PASSWORD: saps_worker_pass
+      POSTGRES_DB: saps_workers
+    ports:
+      - "5488:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

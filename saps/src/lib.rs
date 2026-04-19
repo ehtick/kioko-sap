@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod dal;
 pub mod errors;
+pub mod background_tasks;
 
 mod constants;
 
@@ -12,6 +13,7 @@ pub use axum;
 pub use sqlx;
 pub use mime_guess;
 pub use rust_embed;
+pub use serde_json::Value;
 
 // macros
 pub use saps_db_pool_macro::define_pg_pool;

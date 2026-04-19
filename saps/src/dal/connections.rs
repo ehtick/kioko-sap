@@ -40,6 +40,11 @@ pub struct AuthPostGresDescriptor<T: YieldPostGresPool> {
     db: PhantomData<T>
 }
 
+#[derive(Clone, Debug)]
+pub struct BackgroundTaskPostGresDescriptor<T: YieldPostGresPool> {
+    db: PhantomData<T>
+}
+
 /// Mock pool that will error if connection is utilised.
 ///
 /// # Notes
