@@ -1,6 +1,6 @@
 [package]
 name = "saps"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Core library for the SAP framework"
 license = "MIT"
@@ -28,6 +28,7 @@ saps-db-pool-macro = "0.1.1"
 saps-db-tx = "0.1.1"
 saps-test-macro = "0.1.2"
 saps-frontend-macro = "0.1.0"
+saps-background-task = "0.1.0"
 
 [dev-dependencies]
 http-body-util = { workspace = true }
