@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::errors::saps::SapsError;
 
 
-pub type TaskFnPtr = fn(Value) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send>>;
+pub type TaskFnPtr = fn(Value, &'static sqlx::Pool<sqlx::Postgres>) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send>>;
 
 
 pub struct BackgroundTaskEntry {

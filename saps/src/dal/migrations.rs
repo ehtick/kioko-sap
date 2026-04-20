@@ -1,6 +1,7 @@
 use sqlx::{Executor, Pool, Postgres};
 use crate::auth::dal::model::AuthSession;
 use crate::auth::token::checks::UserRole;
+use crate::background_tasks::dal::model::QueuedTask;
 
 /// Runs all framework migrations against the provided connection pool.
 ///
@@ -12,6 +13,9 @@ pub async fn run_migrations(pool: &Pool<Postgres>) {
     // same regardless of the type parameter — it's a static string.
     // Use a dummy type to call it.
     let sql = AuthSession::<DummyRole>::generate_migration_sql();
+    pool.execute(sql).await.expect("failed to run saps migrations");
+    
+    let sql = QueuedTask::generate_migration_sql();
     pool.execute(sql).await.expect("failed to run saps migrations");
 }
 

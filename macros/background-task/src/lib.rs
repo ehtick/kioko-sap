@@ -39,7 +39,7 @@ pub fn background_task(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
 
         // function that gets called by the worker
-        pub async fn #core_ident (input_val: saps::Value) -> Result<(), saps::errors::saps::SapsError> {
+        pub async fn #core_ident (input_val: saps::Value, pool: &'static saps::sqlx::Pool<saps::sqlx::Postgres>) -> Result<(), saps::errors::saps::SapsError> {
             // extract the params from the package
             #extract_tokens
             // original function body
@@ -67,7 +67,7 @@ pub fn background_task(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 .unwrap()
                 .insert(
                     #name.to_string(),
-                    |params| Box::pin(#core_ident(params)),
+                    |params, pool| Box::pin(#core_ident(params, pool)),
                 );
         }
     };
