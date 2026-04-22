@@ -198,7 +198,7 @@ macro_rules! define_static_config {
     ($handle:ident, $( $key:expr => $value:expr ),*) => {
         #[derive(Clone)]
         pub struct $handle;
-        impl kernel::config::GetConfigVariable for $handle {
+        impl saps::config::GetConfigVariable for $handle {
             fn get_config_variable(variable: String) -> Result<String, saps::errors::saps::SapsError> {
                 match variable.as_str() {
                     $(
