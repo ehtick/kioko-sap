@@ -2,6 +2,7 @@
 //!
 //! # Notes
 //! This is currently a placeholder but happy to talk about the error handling more
+#[cfg(feature = "server")]
 use axum::{
     Json,
     http::StatusCode as AxumStatusCode,
@@ -120,6 +121,7 @@ impl fmt::Display for SapsError {
     }
 }
 
+#[cfg(feature = "server")]
 impl IntoResponse for SapsError {
     fn into_response(self) -> AxumResponse {
         let status_code = match self.status {
@@ -135,6 +137,7 @@ impl IntoResponse for SapsError {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<sqlx::Error> for SapsError {
     fn from(error: sqlx::Error) -> Self {
         match error {
