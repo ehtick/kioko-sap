@@ -2,21 +2,38 @@ use saps_background_task::background_task;
 use saps::background_tasks::registry::TASK_REGISTRY;
 use saps::background_tasks::dal::model::QueuedTask;
 use saps::background_tasks::worker_pool::WorkerPool;
+use saps::scheduled_tasks::dal::model::{ScheduledTask, register_scheduled_task};
+use saps::scheduled_tasks::scheduler::Scheduler;
 use saps::dal::connections::{LivePostGresPool, YieldPostGresPool};
 use saps::sqlx::Executor;
 
 
+// `pool` is injected as a parameter into the generated core function, so
+// every handler must reference it (or shadow it as `_`) to avoid an unused
+// variable warning. Each handler just prints its name and the current UTC time.
+
 #[background_task]
-fn add(one: i32, two: i32) {
-    let sum = one + two;
-    println!("  [add] {} + {} = {}", one, two, sum);
+fn ping_30s() {
+    let _ = pool;
+    println!("  [ping_30s]   tick @ {}", chrono::Utc::now().format("%H:%M:%S UTC"));
 }
 
 #[background_task]
-fn minus(one: i32, two: i32) {
-    let _db_pool = pool;
-    let diff = one - two;
-    println!("  [minus] {} - {} = {}", one, two, diff);
+fn ping_1m() {
+    let _ = pool;
+    println!("  [ping_1m]    tick @ {}", chrono::Utc::now().format("%H:%M:%S UTC"));
+}
+
+#[background_task]
+fn ping_2m() {
+    let _ = pool;
+    println!("  [ping_2m]    tick @ {}", chrono::Utc::now().format("%H:%M:%S UTC"));
+}
+
+#[background_task]
+fn daily_1915() {
+    let _ = pool;
+    println!("  [daily_1915] tick @ {}", chrono::Utc::now().format("%H:%M:%S UTC"));
 }
 
 
@@ -30,58 +47,107 @@ async fn main() {
         );
     }
 
-    // Get the database connection pool
     let pool = LivePostGresPool::yield_pool();
 
-    // Drop the table so we get a clean slate every run
+    // Wipe and recreate the queue table for a clean slate.
     pool.execute("DROP TABLE IF EXISTS saps.queued_tasks CASCADE")
         .await
         .expect("failed to drop queued_tasks table");
+    pool.execute(QueuedTask::generate_migration_sql())
+        .await
+        .expect("failed to migrate queued_tasks");
 
-    // Run migrations to recreate the table and stored procedures
-    let sql = QueuedTask::generate_migration_sql();
-    pool.execute(sql).await.expect("failed to run migrations");
+    // ScheduledTask::generate_migration_sql() drops the table internally.
+    pool.execute(ScheduledTask::generate_migration_sql())
+        .await
+        .expect("failed to migrate scheduled_tasks");
 
-    // Print registered background tasks
-    let registry = TASK_REGISTRY.read().unwrap();
-    println!("Registered tasks: {:?}", registry.keys().collect::<Vec<_>>());
-    drop(registry);
+    // Show what the #[background_task] macro registered at startup.
+    {
+        let registry = TASK_REGISTRY.read().unwrap();
+        let mut keys: Vec<&String> = registry.keys().collect();
+        keys.sort();
+        println!("Registered handlers: {:?}", keys);
+    }
 
-    // Queue up a batch of add and minus tasks
-    println!("\n=== Inserting tasks ===");
-    add::<LivePostGresPool>(1, 2).await.expect("failed to insert add(1,2)");
-    add::<LivePostGresPool>(10, 20).await.expect("failed to insert add(10,20)");
-    add::<LivePostGresPool>(100, 200).await.expect("failed to insert add(100,200)");
-    minus::<LivePostGresPool>(50, 30).await.expect("failed to insert minus(50,30)");
-    minus::<LivePostGresPool>(99, 1).await.expect("failed to insert minus(99,1)");
-    add::<LivePostGresPool>(7, 8).await.expect("failed to insert add(7,8)");
-    minus::<LivePostGresPool>(1000, 1).await.expect("failed to insert minus(1000,1)");
-    add::<LivePostGresPool>(42, 0).await.expect("failed to insert add(42,0)");
-    println!("Inserted 8 tasks");
+    // Register the four schedules. Cron format is 6-field:
+    //   second  minute  hour  day-of-month  month  day-of-week
+    println!("\n=== Registering schedules ===");
+    register_scheduled_task::<LivePostGresPool>(
+        "ping_30s",
+        serde_json::json!({}),
+        "*/30 * * * * *", // every 30 seconds
+    ).await.expect("register ping_30s");
 
-    // Start the worker pool with 2 workers
-    println!("\n=== Starting worker pool (2 workers) ===");
+    register_scheduled_task::<LivePostGresPool>(
+        "ping_1m",
+        serde_json::json!({}),
+        "0 * * * * *", // every minute on the :00
+    ).await.expect("register ping_1m");
+
+    register_scheduled_task::<LivePostGresPool>(
+        "ping_2m",
+        serde_json::json!({}),
+        "0 */2 * * * *", // every 2 minutes on the :00
+    ).await.expect("register ping_2m");
+
+    register_scheduled_task::<LivePostGresPool>(
+        "daily_1915",
+        serde_json::json!({}),
+        "0 23 18 * * *", // every day at 19:15:00 UTC
+    ).await.expect("register daily_1915");
+    println!("Registered 4 schedules.");
+
+    // Start the worker pool that executes queued tasks.
+    println!("\n=== Starting WorkerPool (2 workers, 5s poll) ===");
     let mut worker_pool = WorkerPool::<LivePostGresPool>::new()
         .with_workers(2);
     worker_pool.init_workers();
 
-    // Give workers time to process all tasks
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Start the scheduler that posts due scheduled rows onto the queue.
+    // 10s interval (instead of the 5-minute default) so the every-30s and
+    // every-1-minute schedules become observable within the demo window.
+    println!("=== Starting Scheduler (10s poll) ===");
+    let mut scheduler = Scheduler::<LivePostGresPool>::new()
+        .with_interval(10);
+    scheduler.init();
 
-    // Dump the entire queued_tasks table
-    println!("\n=== Full queued_tasks table ===");
+    // Run for 4 minutes so we can observe several firings of each schedule.
+    let demo_secs = 240;
+    println!("\n=== Running for {}s — ctrl-C to exit early ===\n", demo_secs);
+    tokio::time::sleep(tokio::time::Duration::from_secs(demo_secs)).await;
+
+    // Dump the final state of both tables so we can audit what fired.
+    println!("\n=== Final saps.scheduled_tasks ===");
+    let rows = saps::sqlx::query("SELECT * FROM saps.scheduled_tasks ORDER BY id ASC")
+        .fetch_all(pool)
+        .await
+        .expect("failed to query scheduled_tasks");
+    for row in &rows {
+        let task = ScheduledTask::from_row(row).expect("failed to parse row");
+        println!(
+            "  id={} fn={:<11} next={:?} last_fired={:?} task_id={:?} locked={}",
+            task.id, task.function_name, task.time_scheduled,
+            task.time_completed, task.task_id, task.locked,
+        );
+    }
+
+    println!("\n=== Final saps.queued_tasks ===");
     let rows = saps::sqlx::query("SELECT * FROM saps.queued_tasks ORDER BY time_posted ASC")
         .fetch_all(pool)
         .await
         .expect("failed to query queued_tasks");
-
     for row in &rows {
         let task = QueuedTask::from_row(row).expect("failed to parse row");
         println!(
-            "  id={} fn={:<6} status={:<12} locked={:<5} params={} started={:?} finished={:?}",
-            task.id, task.function_name, task.status, task.locked, task.params,
-            task.time_started, task.time_finished
+            "  fn={:<11} status={:<10} posted={} finished={:?}",
+            task.function_name, task.status, task.time_posted, task.time_finished,
         );
     }
-    println!("=== {} total rows ===", rows.len());
+    println!("=== {} queued rows total ===", rows.len());
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_mins(1)).await;
+        println!("polling");
+    }
 }

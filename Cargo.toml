@@ -95,3 +95,4 @@ rust-embed = "8.11.0"
 
 # background tasks
 ctor = "0.10.0"
+cron = "0.12"

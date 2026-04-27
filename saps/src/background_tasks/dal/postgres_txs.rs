@@ -25,6 +25,7 @@ use super::{
         GetNextBackgroundTask,
         MarkBackgroundTaskAsCompleted,
         MarkBackgroundTaskAsExited,
+        GetBackgroundTaskById,
     },
 };
 use crate::{
@@ -158,4 +159,36 @@ async fn mark_background_task_as_exited(id: uuid::Uuid) -> bool {
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+
+/// Fetches a single background task by its UUID.
+///
+/// # Arguments
+///
+/// * `id` — the UUID of the task to fetch.
+///
+/// # Returns
+///
+/// - `Ok(Some(task))` if a row with the given UUID exists.
+/// - `Ok(None)` if no row was found.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if the query fails or the row cannot be parsed.
+#[db_transaction(BackgroundTaskPostGresDescriptor, GetBackgroundTaskById)]
+async fn mark_background_task_by_id(id: uuid::Uuid) -> Option<QueuedTask> {
+    let pool = T::yield_pool();
+    let row = sqlx::query("SELECT * FROM saps.queued_tasks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let task = QueuedTask::from_row(&r)
+                .map_err(|e| sqlx::Error::Protocol(e.message))?;
+            Ok(Some(task))
+        }
+        None => Ok(None),
+    }
 }

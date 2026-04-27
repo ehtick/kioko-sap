@@ -10,6 +10,8 @@ pub mod config;
 pub mod dal;
 #[cfg(feature = "server")]
 pub mod background_tasks;
+#[cfg(feature = "server")]
+pub mod scheduled_tasks;
 
 #[cfg(feature = "server")]
 mod constants;
