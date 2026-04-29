@@ -57,15 +57,14 @@ where
 
     // Create auth session with user_id in meta
     let session = AuthSession::new(role.clone())
-        .with_meta(serde_json::json!({ "user_id": user.id.to_string() }));
+        .with_meta(serde_json::json!({ "user_id": user.id }));
 
     let created = X::create_auth_session(session).await?;
 
     // Create token with unique_id = session UUID
     // Note: we need a YieldPostGresPool type for HeaderToken but X is trait-based.
     // We use a dummy pool type since encode/decode don't touch the pool.
-    let mut token: HeaderToken<C, Y, R, saps::dal::connections::MockDeadPostGresPool> = HeaderToken::new::<R>()?;
-    token.unique_id = created.id.to_string();
+    let token: HeaderToken<C, Y, R, saps::dal::connections::MockDeadPostGresPool> = HeaderToken::new::<R>()?.set_uuid(&created.id);
     let encoded = token.encode()?;
 
     Ok(LoginResponse {

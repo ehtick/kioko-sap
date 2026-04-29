@@ -25,6 +25,8 @@ pub use sqlx;
 pub use mime_guess;
 #[cfg(feature = "server")]
 pub use rust_embed;
+#[cfg(feature = "server")]
+pub use paste;
 
 pub use serde_json::Value;
 

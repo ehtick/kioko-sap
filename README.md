@@ -2,6 +2,13 @@
 
 This framework combines `Svelte`, `Axum`, `Postgres`, and `sqlx` with helpful macros to enable you to test every part of your system with isolated postgres DBs for each test enabling you to run end to end tests in a multithreaded runtime. It also embeds the frontend into the Rust binary and mounts it to the server so your Axum server is serving the frontend and backend within one binary. Auth cookies are also handled and background/cron jobs are also handled using postgres as task status persistence.
 
+## Contents
+
+- [DB Transactions](#db-transactions)
+- [Config Variables](#config-variables)
+- [Background Tasks](#background-tasks)
+- [Other things that are being worked on](#other-things-that-are-being-worked-on)
+
 ## DB Transactions
 
 DB transactions are the core of this framework because testing and mounting different databases rely on the way we handle DB transactions.
@@ -268,7 +275,22 @@ mod tests {
 }
 ```
 
-You can mount the config var struct just like you would mounting a DB handle to the server with a factory function. Right now you can use a `use saps::config::EnvConfig;` but this calls the environment variables every time. I am currently working on a macro that enables a oncelock setup of the environment variables so they're cached. This will come soon.
+You can mount the config var struct just like you would mounting a DB handle to the server with a factory function. For ease you can use the `use saps::config::EnvConfig;` but this will check config variables for every lookup which is not optimal and surprisingly slow when there's contention. You can use the `define_env_config` macro for optimal config lookups with the following code:
+
+```rust
+use saps::define_env_config;
+use saps::errors::saps::SapsError;
+
+define_env_config!(LiveConfig, "DB_CONNECTION", "SECRET_KEY", "RATE_LIMIT");
+
+fn main() {
+    let result: Result<(), SapsError> = LiveConfig::init();
+}
+```
+
+What happens here essentially is that the `LiveConfig::init()` loops through all the keys provided and gets them from the environment variables. This means you will fail fast if an environment variable is missing. The macro creates oncelocks for each key and a match statement returning the specific oncelock variable depending on the key passed in. This gives us lock free reads that are faster than a hashmap until the number of keys gets into the 100s. Then it is advised that you should look into hashmaps. Once the `init` is called, the config cannot be altered, or reset for the duration of the program.
+
+It must be noted that every lookup clones the value at this point in time. This isn't too bad for now but will work on removing this and also removing the `to_string` requirement for passing in the key.
 
 
 ## Background Tasks

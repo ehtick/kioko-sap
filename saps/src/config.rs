@@ -271,7 +271,7 @@ macro_rules! define_static_config {
 #[macro_export]
 macro_rules! define_env_config {
     ($handle:ident, $( $key:expr ),* $(,)?) => {
-        paste::paste! {
+        saps::paste::paste! {
             $(
                 static [< __CONFIG_ $handle:upper _ $key:upper >]: std::sync::OnceLock<String> = std::sync::OnceLock::new();
             )*

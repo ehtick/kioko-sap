@@ -203,6 +203,18 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
         })
     }
 
+    /// Sets the id. This is used if tethering the token to an auth session.
+    /// 
+    /// # Arguments
+    /// - `id`: The id to be attached to the `self.unique_id`
+    /// 
+    /// # Returns
+    /// The constructed header token
+    pub fn set_uuid(mut self, id: &Uuid) -> Self {
+        self.unique_id = id.to_string();
+        self
+    }
+
     /// Checks whether the token's `time_expire` has passed.
     ///
     /// # Errors
