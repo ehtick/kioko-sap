@@ -92,7 +92,11 @@ use uuid::Uuid;
 use crate::{
     auth::{
         dal::tx_definitions::{PingAuthSession, DeleteAuthSession},
-        token::checks::{CheckUserRole, UserRole},
+        middleware::CookieSlot,
+        token::{
+            checks::{CheckUserRole, UserRole},
+            cookies::AuthTokenCookie,
+        },
     },
     config::GetConfigVariable,
     constants::AUTH_TOKEN_COOKIE_KEY,
@@ -101,23 +105,19 @@ use crate::{
 };
 
 
-/// A `Set-Cookie` value inserted into request extensions when the stored procedure
+/// A `Set-Cookie` value produced by the extractor when the stored procedure
 /// regenerates the session UUID (because `date_created` was older than 5 minutes).
 ///
-/// Handlers or middleware can extract this from `request.extensions()` to include
-/// the updated cookie in the response, ensuring the client's cookie stays in sync
-/// with the new session ID.
+/// The extractor writes one of these into the
+/// [`CookieSlot`](crate::auth::middleware::CookieSlot) installed by
+/// [`attach_refreshed_cookie`](crate::auth::middleware::attach_refreshed_cookie).
+/// The layer then reads it back after the handler runs and attaches it as a
+/// `Set-Cookie` header on the response.
 ///
-/// # Usage in middleware
-///
-/// ```ignore
-/// if let Some(cookie) = request.extensions().get::<UpdatedAuthCookie>() {
-///     response.headers_mut().insert(
-///         axum::http::header::SET_COOKIE,
-///         cookie.0.parse().unwrap(),
-///     );
-/// }
-/// ```
+/// You normally don't construct or read this directly — apply the layer at
+/// router level and the refresh happens transparently. For per-request
+/// observability of rotation events, read [`HeaderToken::old_uuid`] inside
+/// your handler instead.
 #[derive(Debug, Clone)]
 pub struct UpdatedAuthCookie(pub String);
 
@@ -144,6 +144,7 @@ pub struct UpdatedAuthCookie(pub String);
 /// | `db_handle` | No | Phantom marker for the database pool provider `Z` |
 /// | `role` | No | Phantom marker for the concrete role enum `R` |
 /// | `meta` | No | Session metadata loaded from the DB during extraction |
+/// | `old_uuid` | No | The previous UUID when the extractor rotated the session, otherwise `None` |
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> {
     /// The UUID that links this token to its `saps.auth_sessions` row.
@@ -169,6 +170,12 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     /// created tokens and is populated by the [`FromRequestParts`] implementation.
     #[serde(skip)]
     pub meta: Option<serde_json::Value>,
+    /// The previous UUID, populated only when the extractor detected a session
+    /// rotation during [`FromRequestParts`]. `None` for freshly created tokens
+    /// and for requests where no rotation occurred. Not part of the JWT payload —
+    /// handlers can read this to log/observe rotation events.
+    #[serde(skip)]
+    pub old_uuid: Option<String>,
 }
 
 impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> HeaderToken<X, Y, R, Z> {
@@ -200,6 +207,7 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
             db_handle: PhantomData,
             role: PhantomData,
             meta: None,
+            old_uuid: None,
         })
     }
 
@@ -537,17 +545,22 @@ where
         let mut token = token;
 
         // If the stored procedure regenerated the UUID (date_created was older than
-        // 5 minutes), update the token and insert a new cookie into extensions.
+        // 5 minutes), update the token, build the refreshed cookie, and write it
+        // into the response-layer's CookieSlot if one is installed. The slot's
+        // interior mutability is what lets the layer (which already moved the
+        // request into next.run) observe the value after the handler returns.
         if session.id.to_string() != existing_id {
             token.unique_id = session.id.to_string();
             let new_jwt = token.encode()?;
-            let cookie = format!(
-                "{}={}; HttpOnly; Path=/; Max-Age=86400",
-                AUTH_TOKEN_COOKIE_KEY, new_jwt
-            );
-            parts.extensions.insert(UpdatedAuthCookie(cookie));
-            // re-decode the token so we return a valid struct (encode consumes self)
+            let cookie_str = AuthTokenCookie::from(&new_jwt).yield_cookie_string();
+            if let Some(slot) = parts.extensions.get::<CookieSlot>() {
+                slot.set(UpdatedAuthCookie(cookie_str));
+            }
+            // re-decode the token so we return a valid struct (encode consumes self).
+            // Decoded tokens have `old_uuid = None` (it's #[serde(skip)]), so we
+            // re-apply the rotation marker after decoding.
             token = Self::decode(&new_jwt)?;
+            token.old_uuid = Some(existing_id);
         }
         token.meta = session.meta;
         Ok(token)
@@ -972,5 +985,141 @@ mod tests {
         let (status, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body, Bytes::from_static(b"\"Role does not have sufficient permissions\""));
+    }
+
+    // ===== Rotation + cookie attachment integration test =====
+    //
+    // End-to-end test of the rotation flow:
+    //   1. Create a session and backdate `date_created` to >5 min ago.
+    //   2. Hit a handler through the `attach_refreshed_cookie` layer with a JWT
+    //      whose `unique_id` matches the original session id.
+    //   3. The `saps.ping` stored procedure rotates the row to a new UUID.
+    //   4. The extractor populates `token.old_uuid` and stashes the new cookie
+    //      in request extensions.
+    //   5. The layer copies the cookie onto the response as `Set-Cookie`.
+    //   6. We assert: 200 OK, the response carries a Set-Cookie with a JWT that
+    //      decodes to the rotated UUID, and the handler observed `old_uuid` set
+    //      to the original UUID.
+
+    #[saps::db_test]
+    async fn test_rotation_emits_refreshed_set_cookie_and_populates_old_uuid() {
+        use crate::auth::middleware::attach_refreshed_cookie;
+        use crate::constants::AUTH_TOKEN_COOKIE_KEY;
+        use axum::middleware::from_fn;
+
+        type Tk = HeaderToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+
+        // Handler echoes back what it observed from the (post-rotation) token.
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({
+                "unique_id": tok.unique_id,
+                "old_uuid": tok.old_uuid,
+            }))
+        }
+
+        // 1. Create a session whose id matches the JWT's unique_id.
+        let token: Tk = HeaderToken::new::<TestRole>().unwrap();
+        let original_uuid = token.unique_id.clone();
+        let mut session = AuthSession::new(TestRole::Admin);
+        session.id = uuid::Uuid::parse_str(&original_uuid).unwrap();
+        AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await.expect("failed to create session");
+
+        // 2. Backdate date_created so the ping triggers a rotation.
+        saps::sqlx::query("UPDATE saps.auth_sessions SET date_created = NOW() - INTERVAL '6 minutes' WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&original_uuid).unwrap())
+            .execute(pool)
+            .await
+            .expect("failed to backdate session");
+
+        // 3. Build a router with the rotation layer applied.
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(from_fn(attach_refreshed_cookie));
+
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+
+        // 4. Send the request and capture status + headers + body.
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let set_cookie = resp
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("response should carry a refreshed Set-Cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        // 5. Status is OK and the cookie is the refreshed format.
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            set_cookie.starts_with(&format!("{}=", AUTH_TOKEN_COOKIE_KEY)),
+            "expected cookie to start with {}=, got {:?}",
+            AUTH_TOKEN_COOKIE_KEY, set_cookie,
+        );
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("Path=/"));
+        assert!(set_cookie.contains("Max-Age=86400"));
+
+        // 6. The cookie's JWT must decode to a NEW UUID different from the original.
+        let new_jwt = set_cookie
+            .split_once('=')
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(jwt, _)| jwt.to_string())
+            .expect("cookie value should parse");
+        let decoded = Tk::decode(&new_jwt).expect("new JWT should decode");
+        assert_ne!(decoded.unique_id, original_uuid, "UUID should have rotated");
+
+        // 7. The handler saw old_uuid populated with the pre-rotation UUID.
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["old_uuid"], serde_json::Value::String(original_uuid.clone()));
+        assert_eq!(body_json["unique_id"], serde_json::Value::String(decoded.unique_id));
+    }
+
+    #[saps::db_test]
+    async fn test_no_rotation_leaves_old_uuid_none_and_no_set_cookie() {
+        use crate::auth::middleware::attach_refreshed_cookie;
+        use axum::middleware::from_fn;
+
+        type Tk = HeaderToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({
+                "unique_id": tok.unique_id,
+                "old_uuid": tok.old_uuid,
+            }))
+        }
+
+        // Fresh session — date_created is `NOW()`, so no rotation happens.
+        let token: Tk = HeaderToken::new::<TestRole>().unwrap();
+        let mut session = AuthSession::new(TestRole::Admin);
+        session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
+        AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await.expect("failed to create session");
+
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(from_fn(attach_refreshed_cookie));
+
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+            "no rotation occurred, no Set-Cookie should be attached",
+        );
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["old_uuid"], serde_json::Value::Null);
     }
 }

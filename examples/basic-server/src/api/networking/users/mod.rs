@@ -4,7 +4,8 @@ pub mod get;
 pub mod login;
 pub mod logout;
 
-use saps::axum::{Router, routing::{get, post, delete as delete_method}};
+use saps::auth::middleware::attach_refreshed_cookie;
+use saps::axum::{Router, middleware::from_fn, routing::{get, post, delete as delete_method}};
 use saps::config::GetConfigVariable;
 use saps::dal::connections::{
     LivePostGresPool, SqlxPostGresDescriptor, AuthPostGresDescriptor,
@@ -12,6 +13,12 @@ use saps::dal::connections::{
 use crate::roles::{Role, NoRoleCheck};
 
 /// Attaches all user-related views to the router.
+///
+/// The `attach_refreshed_cookie` layer is applied at the bottom: when the
+/// `HeaderToken` extractor rotates a session UUID it stashes the new cookie in
+/// the request extensions, and this layer copies it onto the response as
+/// `Set-Cookie`. Routes that don't use `HeaderToken` are unaffected — the layer
+/// is a no-op when no rotation occurred.
 ///
 /// # Type Parameters
 /// * `C` - A type that implements `GetConfigVariable` (e.g. `EnvConfig` or a test config)
@@ -61,4 +68,5 @@ where
             >,
         ),
     )
+    .layer(from_fn(attach_refreshed_cookie))
 }

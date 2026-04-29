@@ -2,14 +2,13 @@ use saps::axum::{Json, http::StatusCode, response::IntoResponse};
 use saps::auth::token::checks::{CheckUserRole, UserRole};
 use saps::auth::token::header_token::HeaderToken;
 use saps::config::GetConfigVariable;
-use saps::dal::connections::{AuthPostGresDescriptor, YieldPostGresPool};
-use saps::auth::dal::tx_definitions::PingAuthSession;
+use saps::dal::connections::YieldPostGresPool;
 use crate::api::core::users::get::get_user;
 use crate::dal::models::users::tx_definitions::GetUserById;
 
 /// GET /users/me — returns the authenticated user's profile.
-/// The HeaderToken extractor validates the session. We then ping the session
-/// to retrieve the meta (which contains user_id) and look up the user.
+/// The HeaderToken extractor validates the session and populates `token.meta`
+/// from the session's JSONB column, so we read user_id directly from the token.
 pub async fn get_user_handler<X, C, Y, R, Z>(
     token: HeaderToken<C, Y, R, Z>,
 ) -> Result<impl IntoResponse, impl IntoResponse>
@@ -20,13 +19,8 @@ where
     R: UserRole + Send + Sync,
     Z: YieldPostGresPool + Send + Sync,
 {
-    // Ping the session to get meta with user_id
-    let session = AuthPostGresDescriptor::<Z>::ping_auth_session::<R>(10, &token.unique_id)
-        .await
-        .map_err(|e| saps::errors::saps::SapsError::unknown(e.to_string()))?
-        .ok_or_else(|| saps::errors::saps::SapsError::unauthorized("session not found"))?;
-
-    match get_user::<X>(session.meta).await {
+    let meta = token.get_meta()?.clone();
+    match get_user::<X>(Some(meta)).await {
         Ok(user) => Ok((StatusCode::OK, Json(user))),
         Err(e) => Err(e),
     }
