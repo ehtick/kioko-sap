@@ -196,7 +196,7 @@ impl GetConfigVariable for EnvConfig {
 #[macro_export]
 macro_rules! define_static_config {
     ($handle:ident, $( $key:expr => $value:expr ),*) => {
-        #[derive(Clone)]
+        #[derive(Clone, Debug)]
         pub struct $handle;
         impl saps::config::GetConfigVariable for $handle {
             fn get_config_variable(variable: String) -> Result<String, saps::errors::saps::SapsError> {
