@@ -47,8 +47,9 @@
 use super::{
     model::AuthSession,
     tx_definitions::{
-        CreateAuthSession, DeleteAuthSession, GetAllAuthSessions, GetAuthSession, PingAuthSession,
-        DeleteAuthSessionMetaKey, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+        CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
+        DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
+        GetAuthSessionsByMetaKey, PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
     },
 };
 use crate::{
@@ -327,6 +328,118 @@ async fn delete_auth_session_meta_key<U: UserRole>(
         }
         None => Ok(None),
     }
+}
+
+/// Returns every auth session whose `meta` contains the given key/value pair.
+///
+/// Uses the JSONB containment operator `@>`, so `meta` must include the named
+/// key with a value equal to `value` (other keys are ignored). Sessions whose
+/// `meta` is `NULL` never match. The query is index-friendly with a GIN index
+/// on `meta`.
+///
+/// # Arguments
+///
+/// * `key` - The top-level key to look for in `meta`.
+/// * `value` - The JSON value the key must equal.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The query fails
+/// - Any row's `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, GetAuthSessionsByMetaKey)]
+async fn get_auth_sessions_by_meta_key<U: UserRole>(
+    key: &str,
+    value: Value,
+) -> Vec<AuthSession<U>> {
+    let pool = T::yield_pool();
+    let rows = sqlx::query(
+        "SELECT id, role, date_created, last_interacted, meta \
+         FROM saps.auth_sessions \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb)",
+    )
+        .bind(key)
+        .bind(value)
+        .fetch_all(pool)
+        .await?;
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        sessions.push(AuthSession::from_row(row).map_err(|e| sqlx::Error::Protocol(e.message))?);
+    }
+    Ok(sessions)
+}
+
+/// Returns at most one auth session whose `meta` contains the given key/value
+/// pair.
+///
+/// Designed to be paired with a partial unique index on `meta->>key` (see
+/// [`AuthSession::generate_unique_meta_key_sql`](super::model::AuthSession::generate_unique_meta_key_sql)),
+/// where the index guarantees that at most one row can match. The query
+/// itself uses `LIMIT 1` so it stays correct even if the unique index is
+/// missing — it just becomes "any one matching row" in that case.
+///
+/// # Arguments
+///
+/// * `key` - The top-level key to look for in `meta`.
+/// * `value` - The JSON value the key must equal.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, GetAuthSessionByMetaKey)]
+async fn get_auth_session_by_meta_key<U: UserRole>(
+    key: &str,
+    value: Value,
+) -> Option<AuthSession<U>> {
+    let pool = T::yield_pool();
+    let row = sqlx::query(
+        "SELECT id, role, date_created, last_interacted, meta \
+         FROM saps.auth_sessions \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb) \
+         LIMIT 1",
+    )
+        .bind(key)
+        .bind(value)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let session =
+                AuthSession::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Deletes every auth session whose `meta` contains the given key/value pair.
+///
+/// Uses the JSONB containment operator `@>` to match rows where `meta`
+/// includes `key` with a value equal to `value`. Returns the number of rows
+/// removed.
+///
+/// # Arguments
+///
+/// * `key` - The top-level key to look for in `meta`.
+/// * `value` - The JSON value the key must equal.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if the query fails.
+#[db_transaction(AuthPostGresDescriptor, DeleteAuthSessionsByMetaKey)]
+async fn delete_auth_sessions_by_meta_key(key: &str, value: Value) -> u64 {
+    let pool = T::yield_pool();
+    let result = sqlx::query(
+        "DELETE FROM saps.auth_sessions \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb)",
+    )
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// Deletes an auth session by its UUID.

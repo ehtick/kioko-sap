@@ -1,8 +1,9 @@
 use crate::auth::token::checks::UserRole;
+use crate::dal::connections::YieldPostGresPool;
 use crate::errors::saps::SapsError;
 use chrono::NaiveDateTime;
 use serde::Serialize;
-use sqlx::{Row, postgres::PgRow};
+use sqlx::{Executor, Row, postgres::PgRow};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,14 +135,84 @@ END;
 $$;
 "#
     }
+
+    /// Returns SQL that creates a partial unique index enforcing that no two
+    /// sessions share the same value at `meta->>key`.
+    ///
+    /// Run this once per `meta` key whose value should be unique across all
+    /// sessions (e.g. `"user_id"` to enforce one active session per user).
+    /// Sessions whose `meta` does not contain `key` (including those where
+    /// `meta IS NULL`) are excluded by the partial `WHERE meta ? key` clause,
+    /// so they never collide with one another.
+    ///
+    /// The index name is `idx_saps_auth_sessions_meta_<key>` with non-alnum
+    /// characters stripped, so two keys that differ only in punctuation would
+    /// collide. Pass simple alphanumeric keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is empty, or contains a single quote (which would
+    /// break the embedded SQL string literal).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Run after generate_migration_sql to enforce one session per user_id
+    /// sqlx::raw_sql(AuthSession::<MyRole>::generate_migration_sql())
+    ///     .execute(&pool).await?;
+    /// sqlx::raw_sql(&AuthSession::<MyRole>::generate_unique_meta_key_sql("user_id"))
+    ///     .execute(&pool).await?;
+    /// ```
+    pub fn generate_unique_meta_key_sql(key: &str) -> String {
+        assert!(!key.is_empty(), "meta key must not be empty");
+        assert!(
+            !key.contains('\''),
+            "meta key must not contain single quotes: {:?}",
+            key
+        );
+        let safe_name: String = key
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_saps_auth_sessions_meta_{safe_name} \
+             ON saps.auth_sessions ((meta->>'{key}')) \
+             WHERE meta ? '{key}';\n",
+        )
+    }
+
+    /// Runs the auth session migration against the pool exposed by `Y`.
+    ///
+    /// Executes [`generate_migration_sql`](Self::generate_migration_sql) and
+    /// then one [`generate_unique_meta_key_sql`](Self::generate_unique_meta_key_sql)
+    /// statement for every entry in `unique_meta_keys`. Pass `&[]` to skip the
+    /// uniqueness indexes. Each statement uses `IF NOT EXISTS` / `CREATE OR
+    /// REPLACE`, so this is safe to call on every startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `sqlx::Error` if any statement fails (e.g. an existing unique
+    /// index would be violated by current data).
+    pub async fn run_migration<Y: YieldPostGresPool>(
+        unique_meta_keys: &[&str],
+    ) -> Result<(), sqlx::Error> {
+        let pool = Y::yield_pool();
+        pool.execute(Self::generate_migration_sql()).await?;
+        for key in unique_meta_keys {
+            let sql = Self::generate_unique_meta_key_sql(key);
+            pool.execute(sql.as_str()).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::dal::tx_definitions::{
-        CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey, GetAllAuthSessions,
-        PingAuthSession, UpsertAuthSessionMetaKey,
+        CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
+        DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSessionByMetaKey,
+        GetAuthSessionsByMetaKey, PingAuthSession, UpsertAuthSessionMetaKey,
     };
     use crate::dal::connections::AuthPostGresDescriptor;
 
@@ -486,5 +557,245 @@ mod tests {
             .await
             .expect("failed to delete meta key");
         assert!(result.is_none());
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_sessions_by_meta_key_filters_matches() {
+        let _a = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create a");
+        let _b = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create b");
+        let _c = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 2})),
+        )
+        .await
+        .expect("create c");
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key::<TestRole>(
+                "user_id",
+                serde_json::json!(1),
+            )
+            .await
+            .expect("get by meta key");
+        assert_eq!(matches.len(), 2);
+        for session in &matches {
+            assert_eq!(session.meta.as_ref().unwrap()["user_id"], serde_json::json!(1));
+        }
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_sessions_by_meta_key_no_matches() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create");
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key::<TestRole>(
+                "user_id",
+                serde_json::json!(99),
+            )
+            .await
+            .expect("get by meta key");
+        assert!(matches.is_empty());
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_sessions_by_meta_key_ignores_null_meta() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(AuthSession::new(
+            TestRole::Admin,
+        ))
+        .await
+        .expect("create");
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key::<TestRole>(
+                "user_id",
+                serde_json::json!(1),
+            )
+            .await
+            .expect("get by meta key");
+        assert!(matches.is_empty());
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_by_meta_key_returns_one() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 7})),
+        )
+        .await
+        .expect("create");
+
+        let found =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_by_meta_key::<TestRole>(
+                "user_id",
+                serde_json::json!(7),
+            )
+            .await
+            .expect("get by meta key")
+            .expect("session should exist");
+        assert_eq!(found.id, created.id);
+        assert_eq!(found.role, TestRole::Customer);
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_by_meta_key_no_match_returns_none() {
+        let result =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_by_meta_key::<TestRole>(
+                "user_id",
+                serde_json::json!(7),
+            )
+            .await
+            .expect("get by meta key");
+        assert!(result.is_none());
+    }
+
+    #[saps::db_test]
+    async fn test_delete_auth_sessions_by_meta_key() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create a");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create b");
+        let survivor = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 2})),
+        )
+        .await
+        .expect("create c");
+
+        let deleted =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_sessions_by_meta_key(
+                "user_id",
+                serde_json::json!(1),
+            )
+            .await
+            .expect("delete by meta key");
+        assert_eq!(deleted, 2);
+
+        let remaining =
+            AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+                .await
+                .expect("get all");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, survivor.id);
+    }
+
+    #[saps::db_test]
+    async fn test_delete_auth_sessions_by_meta_key_no_matches() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create");
+
+        let deleted =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_sessions_by_meta_key(
+                "user_id",
+                serde_json::json!(99),
+            )
+            .await
+            .expect("delete by meta key");
+        assert_eq!(deleted, 0);
+
+        let remaining =
+            AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+                .await
+                .expect("get all");
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[saps::db_test]
+    async fn test_unique_meta_key_blocks_duplicate_value() {
+        AuthSession::<TestRole>::run_migration::<TestDbHandle>(&["user_id"])
+            .await
+            .expect("install unique meta key index");
+
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("first insert should succeed");
+
+        let dup = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await;
+        let err = dup.expect_err("second insert with duplicate user_id must fail");
+        let db_err = match err {
+            sqlx::Error::Database(db_err) => db_err,
+            other => panic!("expected database error, got {:?}", other),
+        };
+        assert!(
+            db_err.is_unique_violation(),
+            "expected unique violation, got: {}",
+            db_err
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_unique_meta_key_allows_distinct_values() {
+        AuthSession::<TestRole>::run_migration::<TestDbHandle>(&["user_id"])
+            .await
+            .expect("install unique meta key index");
+
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("first insert");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 2})),
+        )
+        .await
+        .expect("second insert with different user_id");
+
+        let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+            .await
+            .expect("get all");
+        assert_eq!(all.len(), 2);
+    }
+
+    #[saps::db_test]
+    async fn test_unique_meta_key_partial_index_skips_missing_key() {
+        AuthSession::<TestRole>::run_migration::<TestDbHandle>(&["user_id"])
+            .await
+            .expect("install unique meta key index");
+
+        // Two sessions with no meta at all — partial index excludes them.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(AuthSession::new(
+            TestRole::Admin,
+        ))
+        .await
+        .expect("first insert without meta");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(AuthSession::new(
+            TestRole::Customer,
+        ))
+        .await
+        .expect("second insert without meta");
+
+        // A session with a different key in meta also skips the index.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"team": "backend"})),
+        )
+        .await
+        .expect("insert with unrelated meta key");
+
+        let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+            .await
+            .expect("get all");
+        assert_eq!(all.len(), 3);
     }
 }
