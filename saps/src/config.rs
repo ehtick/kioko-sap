@@ -146,6 +146,7 @@ pub trait GetConfigVariable {
 /// let value = EnvConfig::get_config_variable("MY_APP_KEY".into()).unwrap();
 /// assert_eq!(value, "hello");
 /// ```
+#[derive(Debug, Clone)]
 pub struct EnvConfig;
 
 impl GetConfigVariable for EnvConfig {
