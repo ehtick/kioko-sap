@@ -3,7 +3,7 @@ use crate::dal::connections::YieldPostGresPool;
 use crate::errors::saps::SapsError;
 use chrono::NaiveDateTime;
 use serde::Serialize;
-use sqlx::{Executor, Row, postgres::PgRow};
+use sqlx::{Executor, Pool, Postgres, Row, postgres::PgRow};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +189,10 @@ $$;
     /// uniqueness indexes. Each statement uses `IF NOT EXISTS` / `CREATE OR
     /// REPLACE`, so this is safe to call on every startup.
     ///
+    /// Thin wrapper around
+    /// [`run_migration_with_pool`](Self::run_migration_with_pool) — use that
+    /// directly if you already hold a `&Pool<Postgres>`.
+    ///
     /// # Errors
     ///
     /// Returns `sqlx::Error` if any statement fails (e.g. an existing unique
@@ -196,7 +200,24 @@ $$;
     pub async fn run_migration<Y: YieldPostGresPool>(
         unique_meta_keys: &[&str],
     ) -> Result<(), sqlx::Error> {
-        let pool = Y::yield_pool();
+        Self::run_migration_with_pool(Y::yield_pool(), unique_meta_keys).await
+    }
+
+    /// Same as [`run_migration`](Self::run_migration) but takes the pool by
+    /// reference instead of via the [`YieldPostGresPool`] trait.
+    ///
+    /// Useful when the caller already has a `&Pool<Postgres>` (e.g. inside a
+    /// startup routine or a one-off script) and doesn't want to wire up a
+    /// `YieldPostGresPool` impl just to run the migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `sqlx::Error` if any statement fails (e.g. an existing unique
+    /// index would be violated by current data).
+    pub async fn run_migration_with_pool(
+        pool: &Pool<Postgres>,
+        unique_meta_keys: &[&str],
+    ) -> Result<(), sqlx::Error> {
         pool.execute(Self::generate_migration_sql()).await?;
         for key in unique_meta_keys {
             let sql = Self::generate_unique_meta_key_sql(key);
