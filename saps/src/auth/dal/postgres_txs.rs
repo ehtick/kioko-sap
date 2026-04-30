@@ -46,13 +46,17 @@
 
 use super::{
     model::AuthSession,
-    tx_definitions::{CreateAuthSession, DeleteAuthSession, GetAllAuthSessions, PingAuthSession},
+    tx_definitions::{
+        CreateAuthSession, DeleteAuthSession, GetAllAuthSessions, GetAuthSession, PingAuthSession,
+        UpdateAuthSessionMeta,
+    },
 };
 use crate::{
     auth::token::checks::UserRole,
     dal::connections::AuthPostGresDescriptor,
     db_transaction,
 };
+use serde_json::Value;
 
 
 /// Inserts a new auth session into `saps.auth_sessions`.
@@ -158,6 +162,72 @@ async fn get_all_auth_sessions<U: UserRole>() -> Vec<AuthSession<U>> {
         );
     }
     Ok(sessions)
+}
+
+/// Fetches a single auth session by its id.
+///
+/// Returns `Some(AuthSession<U>)` if a row exists with the given id, or `None`
+/// if no session is found. The `role` VARCHAR is parsed back into `U` via
+/// `TryFrom<String>`.
+///
+/// # Arguments
+///
+/// * `session_id` - The UUID of the session to fetch, as a string.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The `session_id` is not a valid UUID
+/// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, GetAuthSession)]
+async fn get_auth_session<U: UserRole>(session_id: &str) -> Option<AuthSession<U>> {
+    let pool = T::yield_pool();
+    let parsed_id: uuid::Uuid = session_id.parse()
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
+    let row = sqlx::query(
+        "SELECT id, role, date_created, last_interacted, meta FROM saps.auth_sessions WHERE id = $1"
+    )
+        .bind(parsed_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let session = AuthSession::from_row(&r)
+                .map_err(|e| sqlx::Error::Protocol(e.message))?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Replaces the `meta` JSON for an existing auth session.
+///
+/// Updates the `meta` column of the row matching `session_id` with the supplied
+/// JSON value. No error is returned if the session does not exist; the update
+/// simply affects zero rows.
+///
+/// # Arguments
+///
+/// * `session_id` - The UUID of the session to update, as a string.
+/// * `meta` - The JSON value to store in the `meta` column.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The `session_id` is not a valid UUID
+/// - The query fails
+#[db_transaction(AuthPostGresDescriptor, UpdateAuthSessionMeta)]
+async fn update_auth_session_meta(session_id: &str, meta: Value) -> () {
+    let pool = T::yield_pool();
+    let parsed_id: uuid::Uuid = session_id.parse()
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
+    sqlx::query("UPDATE saps.auth_sessions SET meta = $1 WHERE id = $2")
+        .bind(meta)
+        .bind(parsed_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Deletes an auth session by its UUID.
