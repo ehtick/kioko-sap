@@ -50,6 +50,7 @@ use super::{
         CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
         DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
         GetAuthSessionsByMetaKey, PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+        UpsertAuthSessionsMetaKeyByMeta,
     },
 };
 use crate::{
@@ -412,6 +413,53 @@ async fn get_auth_session_by_meta_key<U: UserRole>(
         }
         None => Ok(None),
     }
+}
+
+/// Sets `upsert_key`/`upsert_value` on every session whose `meta` matches
+/// `match_key`/`match_value`, returning the number of rows that were updated.
+///
+/// Combines [`get_auth_sessions_by_meta_key`] (containment lookup) and
+/// [`upsert_auth_session_meta_key`] (jsonb_set with `create_missing`) into a
+/// single statement so the lookup and the write happen atomically. `meta` is
+/// coalesced from `NULL` to `'{}'::jsonb` before the upsert, so a row that
+/// only carries the match key (and has no other meta) still gets the new
+/// key inserted.
+///
+/// Pair this with a partial unique index on `match_key` (see
+/// [`AuthSession::generate_unique_meta_key_sql`](super::model::AuthSession::generate_unique_meta_key_sql))
+/// to guarantee the return value is `0` or `1`. Without the index, every
+/// session whose `meta` contains the matching pair is updated.
+///
+/// # Arguments
+///
+/// * `match_key` - Top-level key used to find the target session(s).
+/// * `match_value` - JSON value the match key must equal.
+/// * `upsert_key` - Top-level key to insert or overwrite in `meta`.
+/// * `upsert_value` - JSON value to associate with `upsert_key`.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if the query fails.
+#[db_transaction(AuthPostGresDescriptor, UpsertAuthSessionsMetaKeyByMeta)]
+async fn upsert_auth_sessions_meta_key_by_meta(
+    match_key: &str,
+    match_value: Value,
+    upsert_key: &str,
+    upsert_value: Value,
+) -> u64 {
+    let pool = T::yield_pool();
+    let result = sqlx::query(
+        "UPDATE saps.auth_sessions \
+         SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), ARRAY[$3], $4, true) \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb)",
+    )
+        .bind(match_key)
+        .bind(match_value)
+        .bind(upsert_key)
+        .bind(upsert_value)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// Deletes every auth session whose `meta` contains the given key/value pair.

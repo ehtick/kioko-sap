@@ -232,8 +232,9 @@ mod tests {
     use super::*;
     use crate::auth::dal::tx_definitions::{
         CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
-        DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSessionByMetaKey,
+        DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
         GetAuthSessionsByMetaKey, PingAuthSession, UpsertAuthSessionMetaKey,
+        UpsertAuthSessionsMetaKeyByMeta,
     };
     use crate::dal::connections::AuthPostGresDescriptor;
 
@@ -818,5 +819,144 @@ mod tests {
             .await
             .expect("get all");
         assert_eq!(all.len(), 3);
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_inserts_new_key_and_preserves_others() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "team": "backend"})),
+        )
+        .await
+        .expect("create");
+
+        let count =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_sessions_meta_key_by_meta(
+                "user_id",
+                serde_json::json!(1),
+                "level",
+                serde_json::json!(3),
+            )
+            .await
+            .expect("upsert by meta");
+        assert_eq!(count, 1);
+
+        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &created.id.to_string(),
+        )
+        .await
+        .expect("get session")
+        .expect("session should exist");
+        assert_eq!(
+            fetched.meta,
+            Some(serde_json::json!({"user_id": 1, "team": "backend", "level": 3}))
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_overwrites_existing_key() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 1, "team": "backend"})),
+        )
+        .await
+        .expect("create");
+
+        let count =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_sessions_meta_key_by_meta(
+                "user_id",
+                serde_json::json!(1),
+                "team",
+                serde_json::json!("platform"),
+            )
+            .await
+            .expect("upsert by meta");
+        assert_eq!(count, 1);
+
+        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &created.id.to_string(),
+        )
+        .await
+        .expect("get session")
+        .expect("session should exist");
+        assert_eq!(
+            fetched.meta,
+            Some(serde_json::json!({"user_id": 1, "team": "platform"}))
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_no_matches_returns_zero() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create");
+
+        let count =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_sessions_meta_key_by_meta(
+                "user_id",
+                serde_json::json!(99),
+                "level",
+                serde_json::json!(3),
+            )
+            .await
+            .expect("upsert by meta");
+        assert_eq!(count, 0);
+
+        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &created.id.to_string(),
+        )
+        .await
+        .expect("get session")
+        .expect("session should exist");
+        assert_eq!(fetched.meta, Some(serde_json::json!({"user_id": 1})));
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_updates_every_match() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create a");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create b");
+        let untouched = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 2})),
+        )
+        .await
+        .expect("create c");
+
+        let count =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_sessions_meta_key_by_meta(
+                "user_id",
+                serde_json::json!(1),
+                "flag",
+                serde_json::json!(true),
+            )
+            .await
+            .expect("upsert by meta");
+        assert_eq!(count, 2);
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key::<TestRole>(
+                "flag",
+                serde_json::json!(true),
+            )
+            .await
+            .expect("get by meta key");
+        assert_eq!(matches.len(), 2);
+
+        let unchanged = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &untouched.id.to_string(),
+        )
+        .await
+        .expect("get session")
+        .expect("session should exist");
+        assert_eq!(unchanged.meta, Some(serde_json::json!({"user_id": 2})));
     }
 }
