@@ -141,7 +141,7 @@ mod tests {
     use super::*;
     use crate::auth::dal::tx_definitions::{
         CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey, GetAllAuthSessions,
-        GetAuthSession, PingAuthSession, UpsertAuthSessionMetaKey,
+        PingAuthSession, UpsertAuthSessionMetaKey,
     };
     use crate::dal::connections::AuthPostGresDescriptor;
 
@@ -339,21 +339,18 @@ mod tests {
             .expect("failed to create session");
         assert!(created.meta.is_none());
 
-        AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key(
-            &created.id.to_string(),
-            "user_id",
-            serde_json::json!(42),
-        )
-        .await
-        .expect("failed to upsert meta key");
-
-        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
-            &created.id.to_string(),
-        )
-        .await
-        .expect("failed to get session")
-        .expect("session should exist");
-        assert_eq!(fetched.meta, Some(serde_json::json!({"user_id": 42})));
+        let updated =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key::<TestRole>(
+                &created.id.to_string(),
+                "user_id",
+                serde_json::json!(42),
+            )
+            .await
+            .expect("failed to upsert meta key")
+            .expect("session should exist");
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.role, TestRole::Admin);
+        assert_eq!(updated.meta, Some(serde_json::json!({"user_id": 42})));
     }
 
     #[saps::db_test]
@@ -364,22 +361,18 @@ mod tests {
             .await
             .expect("failed to create session");
 
-        AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key(
-            &created.id.to_string(),
-            "level",
-            serde_json::json!(3),
-        )
-        .await
-        .expect("failed to upsert meta key");
-
-        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
-            &created.id.to_string(),
-        )
-        .await
-        .expect("failed to get session")
-        .expect("session should exist");
+        let updated =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key::<TestRole>(
+                &created.id.to_string(),
+                "level",
+                serde_json::json!(3),
+            )
+            .await
+            .expect("failed to upsert meta key")
+            .expect("session should exist");
+        assert_eq!(updated.id, created.id);
         assert_eq!(
-            fetched.meta,
+            updated.meta,
             Some(serde_json::json!({"user_id": 7, "team": "backend", "level": 3}))
         );
     }
@@ -392,24 +385,33 @@ mod tests {
             .await
             .expect("failed to create session");
 
-        AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key(
-            &created.id.to_string(),
-            "team",
-            serde_json::json!("platform"),
-        )
-        .await
-        .expect("failed to upsert meta key");
-
-        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
-            &created.id.to_string(),
-        )
-        .await
-        .expect("failed to get session")
-        .expect("session should exist");
+        let updated =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key::<TestRole>(
+                &created.id.to_string(),
+                "team",
+                serde_json::json!("platform"),
+            )
+            .await
+            .expect("failed to upsert meta key")
+            .expect("session should exist");
         assert_eq!(
-            fetched.meta,
+            updated.meta,
             Some(serde_json::json!({"user_id": 7, "team": "platform"}))
         );
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_key_missing_session_returns_none() {
+        let fake_id = uuid::Uuid::new_v4().to_string();
+        let result =
+            AuthPostGresDescriptor::<TestDbHandle>::upsert_auth_session_meta_key::<TestRole>(
+                &fake_id,
+                "user_id",
+                serde_json::json!(1),
+            )
+            .await
+            .expect("failed to upsert meta key");
+        assert!(result.is_none());
     }
 
     #[saps::db_test]
@@ -420,21 +422,17 @@ mod tests {
             .await
             .expect("failed to create session");
 
-        AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key(
-            &created.id.to_string(),
-            "team",
-        )
-        .await
-        .expect("failed to delete meta key");
-
-        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
-            &created.id.to_string(),
-        )
-        .await
-        .expect("failed to get session")
-        .expect("session should exist");
+        let updated =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key::<TestRole>(
+                &created.id.to_string(),
+                "team",
+            )
+            .await
+            .expect("failed to delete meta key")
+            .expect("session should exist");
+        assert_eq!(updated.id, created.id);
         assert_eq!(
-            fetched.meta,
+            updated.meta,
             Some(serde_json::json!({"user_id": 7, "level": 3}))
         );
     }
@@ -447,20 +445,15 @@ mod tests {
             .await
             .expect("failed to create session");
 
-        AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key(
-            &created.id.to_string(),
-            "does_not_exist",
-        )
-        .await
-        .expect("failed to delete meta key");
-
-        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
-            &created.id.to_string(),
-        )
-        .await
-        .expect("failed to get session")
-        .expect("session should exist");
-        assert_eq!(fetched.meta, Some(meta));
+        let updated =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key::<TestRole>(
+                &created.id.to_string(),
+                "does_not_exist",
+            )
+            .await
+            .expect("failed to delete meta key")
+            .expect("session should exist");
+        assert_eq!(updated.meta, Some(meta));
     }
 
     #[saps::db_test]
@@ -471,19 +464,27 @@ mod tests {
             .expect("failed to create session");
         assert!(created.meta.is_none());
 
-        AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key(
-            &created.id.to_string(),
-            "anything",
-        )
-        .await
-        .expect("failed to delete meta key");
+        let updated =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key::<TestRole>(
+                &created.id.to_string(),
+                "anything",
+            )
+            .await
+            .expect("failed to delete meta key")
+            .expect("session should exist");
+        assert!(updated.meta.is_none());
+    }
 
-        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
-            &created.id.to_string(),
-        )
-        .await
-        .expect("failed to get session")
-        .expect("session should exist");
-        assert!(fetched.meta.is_none());
+    #[saps::db_test]
+    async fn test_delete_meta_key_missing_session_returns_none() {
+        let fake_id = uuid::Uuid::new_v4().to_string();
+        let result =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session_meta_key::<TestRole>(
+                &fake_id,
+                "anything",
+            )
+            .await
+            .expect("failed to delete meta key");
+        assert!(result.is_none());
     }
 }

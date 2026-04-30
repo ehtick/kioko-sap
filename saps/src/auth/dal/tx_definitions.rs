@@ -10,6 +10,6 @@ define_dal_transactions!(
     GetAllAuthSessions => get_all_auth_sessions[U: UserRole]() -> Vec<AuthSession<U>>,
     GetAuthSession => get_auth_session[U: UserRole](session_id: &str) -> Option<AuthSession<U>>,
     UpdateAuthSessionMeta => update_auth_session_meta(session_id: &str, meta: Value) -> (),
-    UpsertAuthSessionMetaKey => upsert_auth_session_meta_key(session_id: &str, key: &str, value: Value) -> (),
-    DeleteAuthSessionMetaKey => delete_auth_session_meta_key(session_id: &str, key: &str) -> ()
+    UpsertAuthSessionMetaKey => upsert_auth_session_meta_key[U: UserRole](session_id: &str, key: &str, value: Value) -> Option<AuthSession<U>>,
+    DeleteAuthSessionMetaKey => delete_auth_session_meta_key[U: UserRole](session_id: &str, key: &str) -> Option<AuthSession<U>>
 );

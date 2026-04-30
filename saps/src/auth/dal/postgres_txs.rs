@@ -230,12 +230,14 @@ async fn update_auth_session_meta(session_id: &str, meta: Value) -> () {
 }
 
 /// Sets a single key in the `meta` JSON of an existing auth session, leaving
-/// all other keys intact.
+/// all other keys intact, and returns the updated session.
 ///
 /// If `meta` is `NULL`, it is treated as an empty object before the key is
 /// inserted. If the key already exists, its value is overwritten; all other
 /// keys are preserved. The merge happens server-side via `jsonb_set` so the
-/// update is atomic with respect to concurrent writers.
+/// update is atomic with respect to concurrent writers. Returns
+/// `Some(AuthSession<U>)` with the post-update row, or `None` if no session
+/// exists for `session_id`.
 ///
 /// # Arguments
 ///
@@ -248,31 +250,46 @@ async fn update_auth_session_meta(session_id: &str, meta: Value) -> () {
 /// Returns `sqlx::Error` if:
 /// - The `session_id` is not a valid UUID
 /// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
 #[db_transaction(AuthPostGresDescriptor, UpsertAuthSessionMetaKey)]
-async fn upsert_auth_session_meta_key(session_id: &str, key: &str, value: Value) -> () {
+async fn upsert_auth_session_meta_key<U: UserRole>(
+    session_id: &str,
+    key: &str,
+    value: Value,
+) -> Option<AuthSession<U>> {
     let pool = T::yield_pool();
     let parsed_id: uuid::Uuid = session_id
         .parse()
         .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
-    sqlx::query(
+    let row = sqlx::query(
         "UPDATE saps.auth_sessions \
          SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), ARRAY[$1], $2, true) \
-         WHERE id = $3",
+         WHERE id = $3 \
+         RETURNING id, role, date_created, last_interacted, meta",
     )
         .bind(key)
         .bind(value)
         .bind(parsed_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
-    Ok(())
+    match row {
+        Some(r) => {
+            let session =
+                AuthSession::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Removes a single top-level key from the `meta` JSON of an existing auth
-/// session, leaving all other keys intact.
+/// session, leaving all other keys intact, and returns the updated session.
 ///
 /// Uses the PostgreSQL `jsonb - text` operator, which strips the named key
 /// from a JSONB object. If `meta` is `NULL` the column stays `NULL`. If the
 /// key is absent the row is rewritten unchanged. Other keys are preserved.
+/// Returns `Some(AuthSession<U>)` with the post-update row, or `None` if no
+/// session exists for `session_id`.
 ///
 /// # Arguments
 ///
@@ -284,18 +301,32 @@ async fn upsert_auth_session_meta_key(session_id: &str, key: &str, value: Value)
 /// Returns `sqlx::Error` if:
 /// - The `session_id` is not a valid UUID
 /// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
 #[db_transaction(AuthPostGresDescriptor, DeleteAuthSessionMetaKey)]
-async fn delete_auth_session_meta_key(session_id: &str, key: &str) -> () {
+async fn delete_auth_session_meta_key<U: UserRole>(
+    session_id: &str,
+    key: &str,
+) -> Option<AuthSession<U>> {
     let pool = T::yield_pool();
     let parsed_id: uuid::Uuid = session_id
         .parse()
         .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
-    sqlx::query("UPDATE saps.auth_sessions SET meta = meta - $1 WHERE id = $2")
+    let row = sqlx::query(
+        "UPDATE saps.auth_sessions SET meta = meta - $1 WHERE id = $2 \
+         RETURNING id, role, date_created, last_interacted, meta",
+    )
         .bind(key)
         .bind(parsed_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
-    Ok(())
+    match row {
+        Some(r) => {
+            let session =
+                AuthSession::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Deletes an auth session by its UUID.
