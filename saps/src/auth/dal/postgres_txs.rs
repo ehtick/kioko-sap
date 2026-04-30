@@ -48,7 +48,7 @@ use super::{
     model::AuthSession,
     tx_definitions::{
         CreateAuthSession, DeleteAuthSession, GetAllAuthSessions, GetAuthSession, PingAuthSession,
-        UpdateAuthSessionMeta,
+        DeleteAuthSessionMetaKey, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
     },
 };
 use crate::{
@@ -223,6 +223,75 @@ async fn update_auth_session_meta(session_id: &str, meta: Value) -> () {
         .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
     sqlx::query("UPDATE saps.auth_sessions SET meta = $1 WHERE id = $2")
         .bind(meta)
+        .bind(parsed_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets a single key in the `meta` JSON of an existing auth session, leaving
+/// all other keys intact.
+///
+/// If `meta` is `NULL`, it is treated as an empty object before the key is
+/// inserted. If the key already exists, its value is overwritten; all other
+/// keys are preserved. The merge happens server-side via `jsonb_set` so the
+/// update is atomic with respect to concurrent writers.
+///
+/// # Arguments
+///
+/// * `session_id` - The UUID of the session to update, as a string.
+/// * `key` - The top-level key to insert or overwrite in the `meta` object.
+/// * `value` - The JSON value to associate with `key`.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The `session_id` is not a valid UUID
+/// - The query fails
+#[db_transaction(AuthPostGresDescriptor, UpsertAuthSessionMetaKey)]
+async fn upsert_auth_session_meta_key(session_id: &str, key: &str, value: Value) -> () {
+    let pool = T::yield_pool();
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
+    sqlx::query(
+        "UPDATE saps.auth_sessions \
+         SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), ARRAY[$1], $2, true) \
+         WHERE id = $3",
+    )
+        .bind(key)
+        .bind(value)
+        .bind(parsed_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Removes a single top-level key from the `meta` JSON of an existing auth
+/// session, leaving all other keys intact.
+///
+/// Uses the PostgreSQL `jsonb - text` operator, which strips the named key
+/// from a JSONB object. If `meta` is `NULL` the column stays `NULL`. If the
+/// key is absent the row is rewritten unchanged. Other keys are preserved.
+///
+/// # Arguments
+///
+/// * `session_id` - The UUID of the session to update, as a string.
+/// * `key` - The top-level key to remove from the `meta` object.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The `session_id` is not a valid UUID
+/// - The query fails
+#[db_transaction(AuthPostGresDescriptor, DeleteAuthSessionMetaKey)]
+async fn delete_auth_session_meta_key(session_id: &str, key: &str) -> () {
+    let pool = T::yield_pool();
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
+    sqlx::query("UPDATE saps.auth_sessions SET meta = meta - $1 WHERE id = $2")
+        .bind(key)
         .bind(parsed_id)
         .execute(pool)
         .await?;

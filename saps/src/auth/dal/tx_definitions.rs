@@ -9,5 +9,7 @@ define_dal_transactions!(
     DeleteAuthSession => delete_auth_session(session_id: uuid::Uuid) -> bool,
     GetAllAuthSessions => get_all_auth_sessions[U: UserRole]() -> Vec<AuthSession<U>>,
     GetAuthSession => get_auth_session[U: UserRole](session_id: &str) -> Option<AuthSession<U>>,
-    UpdateAuthSessionMeta => update_auth_session_meta(session_id: &str, meta: Value) -> ()
+    UpdateAuthSessionMeta => update_auth_session_meta(session_id: &str, meta: Value) -> (),
+    UpsertAuthSessionMetaKey => upsert_auth_session_meta_key(session_id: &str, key: &str, value: Value) -> (),
+    DeleteAuthSessionMetaKey => delete_auth_session_meta_key(session_id: &str, key: &str) -> ()
 );
