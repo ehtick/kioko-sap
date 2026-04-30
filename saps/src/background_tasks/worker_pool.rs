@@ -68,8 +68,6 @@
 //!     tokio::signal::ctrl_c().await.unwrap();
 //! }
 //! ```
-use std::marker::{PhantomData, Send, Sync};
-use tokio::task::JoinHandle;
 use crate::background_tasks::{
     dal::tx_definitions::{
         GetNextBackgroundTask, MarkBackgroundTaskAsCompleted, MarkBackgroundTaskAsExited,
@@ -77,7 +75,8 @@ use crate::background_tasks::{
     registry::TASK_REGISTRY,
 };
 use crate::dal::connections::{BackgroundTaskPostGresDescriptor, YieldPostGresPool};
-
+use std::marker::{PhantomData, Send, Sync};
+use tokio::task::JoinHandle;
 
 /// A pool of background workers that process tasks from the `saps.queued_tasks` table.
 ///
@@ -112,12 +111,10 @@ pub struct WorkerPool<Y: YieldPostGresPool + Sync + Send> {
     worker_handles: Vec<JoinHandle<()>>,
     /// The polling interval in seconds. When a worker finds no pending tasks,
     /// it sleeps for this duration before checking again.
-    interval: usize
+    interval: usize,
 }
 
-
-impl <Y: YieldPostGresPool + Sync + Send> WorkerPool<Y> {
-
+impl<Y: YieldPostGresPool + Sync + Send> WorkerPool<Y> {
     /// Creates a new `WorkerPool` with default settings.
     ///
     /// Defaults:
@@ -129,7 +126,7 @@ impl <Y: YieldPostGresPool + Sync + Send> WorkerPool<Y> {
             db_pool: PhantomData::<Y>,
             worker_num: 1,
             worker_handles: vec![],
-            interval: 10
+            interval: 10,
         }
     }
 
@@ -163,15 +160,11 @@ impl <Y: YieldPostGresPool + Sync + Send> WorkerPool<Y> {
     pub fn init_workers(&mut self) {
         let interval = self.interval;
         for i in 0..self.worker_num {
-            let handle = tokio::task::spawn(async move {
-                worker_cycle::<Y>(i, interval).await
-            });
+            let handle = tokio::task::spawn(async move { worker_cycle::<Y>(i, interval).await });
             self.worker_handles.push(handle);
         }
     }
-
 }
-
 
 /// The core worker loop that polls for and executes background tasks.
 ///
@@ -217,7 +210,11 @@ async fn worker_cycle<Z: YieldPostGresPool + Sync + Send>(number: usize, interva
         let task = match BackgroundTaskPostGresDescriptor::<Z>::get_next_background_task().await {
             Ok(task) => task,
             Err(error) => {
-                tracing::error!("worker number {} error getting background task: {}", number, error);
+                tracing::error!(
+                    "worker number {} error getting background task: {}",
+                    number,
+                    error
+                );
                 continue;
             }
         };
@@ -230,14 +227,22 @@ async fn worker_cycle<Z: YieldPostGresPool + Sync + Send>(number: usize, interva
                     let registry = match TASK_REGISTRY.read() {
                         Ok(reg) => reg,
                         Err(error) => {
-                            tracing::error!("worker number {} error getting registry: {}", number, error);
+                            tracing::error!(
+                                "worker number {} error getting registry: {}",
+                                number,
+                                error
+                            );
                             continue;
                         }
                     };
                     match registry.get(&task.function_name) {
                         Some(handle) => *handle,
                         None => {
-                            tracing::error!("worker number {} handle {} not in registry", number, &task.function_name);
+                            tracing::error!(
+                                "worker number {} handle {} not in registry",
+                                number,
+                                &task.function_name
+                            );
                             continue;
                         }
                     }
@@ -251,21 +256,30 @@ async fn worker_cycle<Z: YieldPostGresPool + Sync + Send>(number: usize, interva
                 let params = task.params.clone();
                 let pool = Z::yield_pool();
                 let rt_handle = tokio::runtime::Handle::current();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    rt_handle.block_on(handler(params, pool))
-                }).await;
+                let outcome =
+                    tokio::task::spawn_blocking(move || rt_handle.block_on(handler(params, pool)))
+                        .await;
 
                 // Step 4: Mark the task as completed or exited based on the outcome.
                 match outcome {
                     Ok(_) => {
                         let _ = BackgroundTaskPostGresDescriptor::<Z>::mark_background_task_as_completed(task.id).await;
-                    },
+                    }
                     Err(error) => {
-                        tracing::error!("worker number {} background task resulted in error: {} for task id: {}", number, error, task.id);
-                        let _ = BackgroundTaskPostGresDescriptor::<Z>::mark_background_task_as_exited(task.id).await;
+                        tracing::error!(
+                            "worker number {} background task resulted in error: {} for task id: {}",
+                            number,
+                            error,
+                            task.id
+                        );
+                        let _ =
+                            BackgroundTaskPostGresDescriptor::<Z>::mark_background_task_as_exited(
+                                task.id,
+                            )
+                            .await;
                     }
                 }
-            },
+            }
             None => {
                 // Step 5: No tasks available — sleep before polling again.
                 tokio::time::sleep(interval_duration).await;
@@ -274,7 +288,6 @@ async fn worker_cycle<Z: YieldPostGresPool + Sync + Send>(number: usize, interva
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -285,8 +298,8 @@ mod tests {
     use crate::background_tasks::registry::TaskFnPtr;
     use crate::dal::connections::MockDeadPostGresPool;
     use crate::errors::saps::SapsError;
-    use std::pin::Pin;
     use std::future::Future;
+    use std::pin::Pin;
 
     // -- Builder tests (no DB needed) --
 
@@ -306,8 +319,7 @@ mod tests {
 
     #[test]
     fn test_with_workers_chaining() {
-        let pool = WorkerPool::<MockDeadPostGresPool>::new()
-            .with_workers(3);
+        let pool = WorkerPool::<MockDeadPostGresPool>::new().with_workers(3);
         assert_eq!(pool.worker_num, 3);
         assert_eq!(pool.interval, 10);
     }
@@ -389,20 +401,25 @@ mod tests {
             .await
             .expect("failed to insert task");
 
-        let marked = BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_completed(task_id)
+        let marked =
+            BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_completed(
+                task_id,
+            )
             .await
             .expect("failed to mark as completed");
         assert!(marked);
 
         // Verify the row in the database
-        let row = saps::sqlx::query("SELECT status, time_finished FROM saps.queued_tasks WHERE id = $1")
-            .bind(task_id)
-            .fetch_one(pool)
-            .await
-            .expect("failed to fetch task");
+        let row =
+            saps::sqlx::query("SELECT status, time_finished FROM saps.queued_tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await
+                .expect("failed to fetch task");
 
         let status: String = sqlx::Row::try_get(&row, "status").unwrap();
-        let time_finished: Option<chrono::NaiveDateTime> = sqlx::Row::try_get(&row, "time_finished").unwrap();
+        let time_finished: Option<chrono::NaiveDateTime> =
+            sqlx::Row::try_get(&row, "time_finished").unwrap();
         assert_eq!(status, "completed");
         assert!(time_finished.is_some());
     }
@@ -417,19 +434,24 @@ mod tests {
             .await
             .expect("failed to insert task");
 
-        let marked = BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_exited(task_id)
+        let marked =
+            BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_exited(
+                task_id,
+            )
             .await
             .expect("failed to mark as exited");
         assert!(marked);
 
-        let row = saps::sqlx::query("SELECT status, time_finished FROM saps.queued_tasks WHERE id = $1")
-            .bind(task_id)
-            .fetch_one(pool)
-            .await
-            .expect("failed to fetch task");
+        let row =
+            saps::sqlx::query("SELECT status, time_finished FROM saps.queued_tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await
+                .expect("failed to fetch task");
 
         let status: String = sqlx::Row::try_get(&row, "status").unwrap();
-        let time_finished: Option<chrono::NaiveDateTime> = sqlx::Row::try_get(&row, "time_finished").unwrap();
+        let time_finished: Option<chrono::NaiveDateTime> =
+            sqlx::Row::try_get(&row, "time_finished").unwrap();
         assert_eq!(status, "exited");
         assert!(time_finished.is_some());
     }
@@ -439,12 +461,18 @@ mod tests {
     async fn test_mark_nonexistent_task_returns_false() {
         let fake_id = uuid::Uuid::new_v4();
 
-        let completed = BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_completed(fake_id)
+        let completed =
+            BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_completed(
+                fake_id,
+            )
             .await
             .expect("failed to mark as completed");
         assert!(!completed);
 
-        let exited = BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_exited(fake_id)
+        let exited =
+            BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_exited(
+                fake_id,
+            )
             .await
             .expect("failed to mark as exited");
         assert!(!exited);
@@ -518,27 +546,34 @@ mod tests {
         // Look up and execute the handler
         let handler = {
             let registry = TASK_REGISTRY.read().unwrap();
-            *registry.get(&claimed.function_name).expect("handler not found")
+            *registry
+                .get(&claimed.function_name)
+                .expect("handler not found")
         };
         let result = handler(claimed.params.clone(), pool).await;
         assert!(result.is_ok());
 
         // Mark as completed
-        let marked = BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_completed(claimed.id)
+        let marked =
+            BackgroundTaskPostGresDescriptor::<TestDbHandle>::mark_background_task_as_completed(
+                claimed.id,
+            )
             .await
             .expect("failed to mark completed");
         assert!(marked);
 
         // Verify final state
-        let row = saps::sqlx::query("SELECT status, time_finished FROM saps.queued_tasks WHERE id = $1")
-            .bind(task_id)
-            .fetch_one(pool)
-            .await
-            .expect("failed to fetch task");
+        let row =
+            saps::sqlx::query("SELECT status, time_finished FROM saps.queued_tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await
+                .expect("failed to fetch task");
 
         let status: String = sqlx::Row::try_get(&row, "status").unwrap();
         assert_eq!(status, "completed");
-        let time_finished: Option<chrono::NaiveDateTime> = sqlx::Row::try_get(&row, "time_finished").unwrap();
+        let time_finished: Option<chrono::NaiveDateTime> =
+            sqlx::Row::try_get(&row, "time_finished").unwrap();
         assert!(time_finished.is_some());
 
         // No more tasks available
@@ -547,5 +582,4 @@ mod tests {
             .expect("failed to get next task");
         assert!(next.is_none());
     }
-
 }

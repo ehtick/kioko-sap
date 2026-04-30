@@ -1,6 +1,6 @@
 //! Defines the functionality around running an SQL script against a database.
-use sqlx::{Executor, Pool, Postgres};
 use crate::errors::saps::SapsError;
+use sqlx::{Executor, Pool, Postgres};
 
 /// Loads a SQL script from a path relative to the workspace root and executes it
 /// against the provided PostgreSQL connection pool.
@@ -19,12 +19,21 @@ pub async fn run_sql_script(pool: &Pool<Postgres>, relative_path: &str) -> Resul
         .unwrap_or_else(|_| std::env::current_dir().expect("failed to get current directory"));
 
     let full_path = workspace_root.join(relative_path);
-    let sql = std::fs::read_to_string(&full_path)
-        .map_err(|e| SapsError::unknown(format!("failed to read SQL file {}: {}", full_path.display(), e)))?;
+    let sql = std::fs::read_to_string(&full_path).map_err(|e| {
+        SapsError::unknown(format!(
+            "failed to read SQL file {}: {}",
+            full_path.display(),
+            e
+        ))
+    })?;
 
-    pool.execute(sql.as_str())
-        .await
-        .map_err(|e| SapsError::unknown(format!("failed to execute SQL script {}: {}", full_path.display(), e)))?;
+    pool.execute(sql.as_str()).await.map_err(|e| {
+        SapsError::unknown(format!(
+            "failed to execute SQL script {}: {}",
+            full_path.display(),
+            e
+        ))
+    })?;
 
     Ok(())
 }
@@ -56,7 +65,12 @@ mod tests {
     async fn test_run_sql_script_file_not_found() {
         let result = run_sql_script(pool, "tests/fixtures/nonexistent.sql").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("failed to read SQL file"));
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("failed to read SQL file")
+        );
     }
 
     #[saps::db_test]
@@ -68,7 +82,12 @@ mod tests {
 
         let result = run_sql_script(pool, "tests/fixtures/bad.sql").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("failed to execute SQL script"));
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("failed to execute SQL script")
+        );
 
         // Clean up
         let _ = std::fs::remove_file(&path);

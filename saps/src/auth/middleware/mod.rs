@@ -39,14 +39,9 @@
 //! The layer is a no-op for requests where no rotation occurred, so it is safe
 //! to apply broadly — even on routes that don't use `HeaderToken` at all.
 
-use std::sync::{Arc, Mutex};
-use axum::{
-    extract::Request,
-    http::header,
-    middleware::Next,
-    response::Response,
-};
 use crate::auth::token::header_token::UpdatedAuthCookie;
+use axum::{extract::Request, http::header, middleware::Next, response::Response};
+use std::sync::{Arc, Mutex};
 
 /// Shared slot installed by [`attach_refreshed_cookie`] into the request
 /// extensions so the [`HeaderToken`](crate::auth::token::header_token::HeaderToken)
@@ -173,10 +168,8 @@ mod tests {
     async fn replaces_existing_set_cookie_from_handler() {
         async fn handler_with_cookie() -> Response {
             let mut resp = "ok".into_response();
-            resp.headers_mut().insert(
-                header::SET_COOKIE,
-                "other=value".parse().unwrap(),
-            );
+            resp.headers_mut()
+                .insert(header::SET_COOKIE, "other=value".parse().unwrap());
             resp
         }
 

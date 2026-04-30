@@ -1,10 +1,9 @@
-use uuid::Uuid;
 use crate::auth::token::checks::UserRole;
 use crate::errors::saps::SapsError;
 use chrono::NaiveDateTime;
 use serde::Serialize;
 use sqlx::{Row, postgres::PgRow};
-
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthSession<U: UserRole> {
@@ -24,15 +23,24 @@ impl<U: UserRole> AuthSession<U> {
     /// Constructs an `AuthSession` from a Postgres row, converting the `role`
     /// column (VARCHAR) into `U` via `TryFrom<String>`.
     pub fn from_row(row: &PgRow) -> Result<Self, SapsError> {
-        let role_str: String = row.try_get("role")
+        let role_str: String = row
+            .try_get("role")
             .map_err(|e| SapsError::unknown(e.to_string()))?;
         let role = U::try_from(role_str)?;
         Ok(Self {
-            id: row.try_get("id").map_err(|e| SapsError::unknown(e.to_string()))?,
+            id: row
+                .try_get("id")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
             role,
-            date_created: row.try_get("date_created").map_err(|e| SapsError::unknown(e.to_string()))?,
-            last_interacted: row.try_get("last_interacted").map_err(|e| SapsError::unknown(e.to_string()))?,
-            meta: row.try_get("meta").map_err(|e| SapsError::unknown(e.to_string()))?,
+            date_created: row
+                .try_get("date_created")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            last_interacted: row
+                .try_get("last_interacted")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            meta: row
+                .try_get("meta")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
         })
     }
 }
@@ -131,7 +139,9 @@ $$;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::dal::tx_definitions::{CreateAuthSession, DeleteAuthSession, GetAllAuthSessions, PingAuthSession};
+    use crate::auth::dal::tx_definitions::{
+        CreateAuthSession, DeleteAuthSession, GetAllAuthSessions, PingAuthSession,
+    };
     use crate::dal::connections::AuthPostGresDescriptor;
 
     #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
@@ -165,7 +175,8 @@ mod tests {
     #[saps::db_test]
     async fn test_create_auth_session() {
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 0);
 
         let session = AuthSession::new(TestRole::Admin);
@@ -176,7 +187,8 @@ mod tests {
         assert!(created.meta.is_none());
 
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 1);
     }
 
@@ -198,9 +210,12 @@ mod tests {
             .await
             .expect("failed to create session");
 
-        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(30, &created.id.to_string())
-            .await
-            .expect("failed to ping session");
+        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+            30,
+            &created.id.to_string(),
+        )
+        .await
+        .expect("failed to ping session");
         assert!(pinged.is_some());
         let pinged = pinged.unwrap();
         assert_eq!(pinged.role, TestRole::Admin);
@@ -209,22 +224,24 @@ mod tests {
     #[saps::db_test]
     async fn test_ping_nonexistent_session_returns_none() {
         let fake_id = uuid::Uuid::new_v4().to_string();
-        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(30, &fake_id)
-            .await
-            .expect("failed to ping session");
+        let pinged =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(30, &fake_id)
+                .await
+                .expect("failed to ping session");
         assert!(pinged.is_none());
     }
 
     #[saps::db_test]
     async fn test_ping_expired_session_returns_none() {
-        let session = AuthSession::new(TestRole::Customer)
-            .with_meta(serde_json::json!({"user_id": 4}));
+        let session =
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 4}));
         let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
             .await
             .expect("failed to create session");
 
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 1);
 
         // Manually backdate last_interacted so the session is expired
@@ -237,27 +254,32 @@ mod tests {
             .expect("failed to backdate session");
 
         // Ping with a 30-minute timeout — session should be expired and deleted
-        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(30, &created.id.to_string())
-            .await
-            .expect("failed to ping session");
+        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+            30,
+            &created.id.to_string(),
+        )
+        .await
+        .expect("failed to ping session");
         assert!(pinged.is_none());
 
         // Expired session should have been deleted by ping
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 0);
     }
 
     #[saps::db_test]
     async fn test_delete_auth_session() {
-        let session = AuthSession::new(TestRole::Admin)
-            .with_meta(serde_json::json!({"user_id": 5}));
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 5}));
         let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
             .await
             .expect("failed to create session");
 
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 1);
 
         let deleted = AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session(created.id)
@@ -266,14 +288,16 @@ mod tests {
         assert!(deleted);
 
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 0);
     }
 
     #[saps::db_test]
     async fn test_delete_nonexistent_session_returns_false() {
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 0);
 
         let fake_id = uuid::Uuid::new_v4();
@@ -283,7 +307,8 @@ mod tests {
         assert!(!deleted);
 
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get all sessions");
+            .await
+            .expect("failed to get all sessions");
         assert_eq!(all.len(), 0);
     }
 
@@ -295,9 +320,12 @@ mod tests {
             .await
             .expect("failed to create session");
 
-        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(30, &created.id.to_string())
-            .await
-            .expect("failed to ping session");
+        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+            30,
+            &created.id.to_string(),
+        )
+        .await
+        .expect("failed to ping session");
         let pinged = pinged.expect("session should exist");
         assert_eq!(pinged.meta, Some(meta));
     }

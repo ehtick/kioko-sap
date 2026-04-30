@@ -12,17 +12,9 @@
 
 use super::{
     model::ScheduledTask,
-    tx_definitions::{
-        InsertScheduledTask,
-        GetDueScheduledTasks,
-        PostScheduledTask,
-    },
+    tx_definitions::{GetDueScheduledTasks, InsertScheduledTask, PostScheduledTask},
 };
-use crate::{
-    dal::connections::ScheduledTaskPostGresDescriptor,
-    db_transaction,
-};
-
+use crate::{dal::connections::ScheduledTaskPostGresDescriptor, db_transaction};
 
 /// Inserts a new scheduled task into `saps.scheduled_tasks`.
 ///
@@ -38,18 +30,17 @@ async fn insert_scheduled_task(task: ScheduledTask) -> bool {
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
-        .bind(task.function_name)
-        .bind(task.params)
-        .bind(task.task_id)
-        .bind(task.time_scheduled)
-        .bind(task.time_completed)
-        .bind(task.cron_string)
-        .bind(task.locked)
-        .execute(pool)
-        .await?;
+    .bind(task.function_name)
+    .bind(task.params)
+    .bind(task.task_id)
+    .bind(task.time_scheduled)
+    .bind(task.time_completed)
+    .bind(task.cron_string)
+    .bind(task.locked)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
-
 
 /// Atomically claims all due scheduled tasks via `saps.claim_due_scheduled_tasks()`.
 ///
@@ -64,13 +55,11 @@ async fn get_due_scheduled_task() -> Vec<ScheduledTask> {
         .await?;
     let mut tasks = Vec::with_capacity(rows.len());
     for row in &rows {
-        let task = ScheduledTask::from_row(row)
-            .map_err(|e| sqlx::Error::Protocol(e.message))?;
+        let task = ScheduledTask::from_row(row).map_err(|e| sqlx::Error::Protocol(e.message))?;
         tasks.push(task);
     }
     Ok(tasks)
 }
-
 
 /// Posts a due scheduled task to the background queue and advances the
 /// scheduled row in a single database transaction.
@@ -100,12 +89,12 @@ async fn post_scheduled_task(task: ScheduledTask) -> bool {
         VALUES ($1, $2, $3, 'pending', $4, NULL, NULL, FALSE)
         "#,
     )
-        .bind(queued_id)
-        .bind(&task.function_name)
-        .bind(&task.params)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+    .bind(queued_id)
+    .bind(&task.function_name)
+    .bind(&task.params)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
 
     let result = sqlx::query(
         r#"
@@ -117,12 +106,12 @@ async fn post_scheduled_task(task: ScheduledTask) -> bool {
         WHERE id = $4
         "#,
     )
-        .bind(task.time_scheduled)
-        .bind(task.time_completed)
-        .bind(queued_id)
-        .bind(task.id)
-        .execute(&mut *tx)
-        .await?;
+    .bind(task.time_scheduled)
+    .bind(task.time_completed)
+    .bind(queued_id)
+    .bind(task.id)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
     Ok(result.rows_affected() > 0)

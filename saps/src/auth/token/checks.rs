@@ -92,7 +92,10 @@ pub trait CheckUserRole {
 ///
 /// When using `construct_checks!` with an enum definition, all three impls (`ToString`,
 /// `TryFrom<String>`, and `UserRole`) are generated automatically.
-pub trait UserRole: ToString + TryFrom<String, Error = SapsError> + Send + Unpin + Serialize + DeserializeOwned {}
+pub trait UserRole:
+    ToString + TryFrom<String, Error = SapsError> + Send + Unpin + Serialize + DeserializeOwned
+{
+}
 
 /// Generates a role enum, its string conversions, and role-check structs.
 ///

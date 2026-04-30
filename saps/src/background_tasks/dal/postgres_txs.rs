@@ -21,18 +21,11 @@
 use super::{
     model::QueuedTask,
     tx_definitions::{
-        InsertBackgroundTask,
-        GetNextBackgroundTask,
-        MarkBackgroundTaskAsCompleted,
-        MarkBackgroundTaskAsExited,
-        GetBackgroundTaskById,
+        GetBackgroundTaskById, GetNextBackgroundTask, InsertBackgroundTask,
+        MarkBackgroundTaskAsCompleted, MarkBackgroundTaskAsExited,
     },
 };
-use crate::{
-    dal::connections::BackgroundTaskPostGresDescriptor,
-    db_transaction,
-};
-
+use crate::{dal::connections::BackgroundTaskPostGresDescriptor, db_transaction};
 
 /// Inserts a new background task into `saps.queued_tasks`.
 ///
@@ -64,7 +57,6 @@ async fn insert_background_task(task: QueuedTask) -> bool {
     Ok(result.rows_affected() > 0)
 }
 
-
 /// Atomically claims the next unlocked background task by calling `saps.get_next_task()`.
 ///
 /// The stored procedure finds the oldest row where `locked = FALSE`, sets `locked = TRUE`,
@@ -94,14 +86,12 @@ async fn get_next_background_task() -> Option<QueuedTask> {
             if id.is_none() {
                 return Ok(None);
             }
-            let task = QueuedTask::from_row(&r)
-                .map_err(|e| sqlx::Error::Protocol(e.message))?;
+            let task = QueuedTask::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
             Ok(Some(task))
         }
         None => Ok(None),
     }
 }
-
 
 /// Marks a background task as completed by setting its status to `'completed'`
 /// and `time_finished` to `NOW()`.
@@ -122,14 +112,13 @@ async fn get_next_background_task() -> Option<QueuedTask> {
 async fn mark_background_task_as_completed(id: uuid::Uuid) -> bool {
     let pool = T::yield_pool();
     let result = sqlx::query(
-        "UPDATE saps.queued_tasks SET status = 'completed', time_finished = NOW() WHERE id = $1"
+        "UPDATE saps.queued_tasks SET status = 'completed', time_finished = NOW() WHERE id = $1",
     )
-        .bind(id)
-        .execute(pool)
-        .await?;
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
-
 
 /// Marks a background task as exited (failed) by setting its status to `'exited'`
 /// and `time_finished` to `NOW()`.
@@ -153,14 +142,13 @@ async fn mark_background_task_as_completed(id: uuid::Uuid) -> bool {
 async fn mark_background_task_as_exited(id: uuid::Uuid) -> bool {
     let pool = T::yield_pool();
     let result = sqlx::query(
-        "UPDATE saps.queued_tasks SET status = 'exited', time_finished = NOW() WHERE id = $1"
+        "UPDATE saps.queued_tasks SET status = 'exited', time_finished = NOW() WHERE id = $1",
     )
-        .bind(id)
-        .execute(pool)
-        .await?;
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
-
 
 /// Fetches a single background task by its UUID.
 ///
@@ -185,8 +173,7 @@ async fn mark_background_task_by_id(id: uuid::Uuid) -> Option<QueuedTask> {
         .await?;
     match row {
         Some(r) => {
-            let task = QueuedTask::from_row(&r)
-                .map_err(|e| sqlx::Error::Protocol(e.message))?;
+            let task = QueuedTask::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
             Ok(Some(task))
         }
         None => Ok(None),

@@ -1,10 +1,10 @@
-use saps::axum::{Json, http::StatusCode, response::IntoResponse};
-use saps::auth::token::checks::{CheckUserRole, UserRole};
-use saps::auth::token::header_token::HeaderToken;
-use saps::config::GetConfigVariable;
-use saps::dal::connections::YieldPostGresPool;
 use crate::api::core::users::get::get_user;
 use crate::dal::models::users::tx_definitions::GetUserById;
+use saps::auth::token::checks::{CheckUserRole, UserRole};
+use saps::auth::token::header_token::HeaderToken;
+use saps::axum::{Json, http::StatusCode, response::IntoResponse};
+use saps::config::GetConfigVariable;
+use saps::dal::connections::YieldPostGresPool;
 
 /// GET /users/me — returns the authenticated user's profile.
 /// The HeaderToken extractor validates the session and populates `token.meta`
@@ -30,10 +30,15 @@ where
 mod tests {
     use super::*;
     use crate::api::core::users::create::{NewUser, create_user};
-    use crate::roles::{Role, NoRoleCheck};
+    use crate::roles::{NoRoleCheck, Role};
     use saps::auth::dal::model::AuthSession;
     use saps::auth::dal::tx_definitions::CreateAuthSession;
-    use saps::axum::{Router, body::{self, Body, Bytes}, http::{Request, StatusCode}, routing::get};
+    use saps::axum::{
+        Router,
+        body::{self, Body, Bytes},
+        http::{Request, StatusCode},
+        routing::get,
+    };
     use saps::dal::connections::{AuthPostGresDescriptor, SqlxPostGresDescriptor};
     use saps::errors::saps::SapsError;
     use tower::ServiceExt;
@@ -69,13 +74,15 @@ mod tests {
             password: "password".to_string(),
         };
         let user = create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
 
         // Create auth session with user_id in meta
         let session = AuthSession::new(Role::Admin)
             .with_meta(serde_json::json!({ "user_id": user.id.to_string() }));
         let created_session = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("create session");
+            .await
+            .expect("create session");
 
         // Build a token whose unique_id matches the session
         type Tk = HeaderToken<TestConfig, NoRoleCheck, Role, TestDbHandle>;
@@ -87,7 +94,14 @@ mod tests {
         async fn handler(
             token: HeaderToken<TestConfig, NoRoleCheck, Role, TestDbHandle>,
         ) -> Result<impl IntoResponse, impl IntoResponse> {
-            get_user_handler::<SqlxPostGresDescriptor<TestDbHandle>, TestConfig, NoRoleCheck, Role, TestDbHandle>(token).await
+            get_user_handler::<
+                SqlxPostGresDescriptor<TestDbHandle>,
+                TestConfig,
+                NoRoleCheck,
+                Role,
+                TestDbHandle,
+            >(token)
+            .await
         }
 
         let app = Router::new().route("/users/me", get(handler));
@@ -119,7 +133,14 @@ mod tests {
         async fn handler(
             token: HeaderToken<TestConfig, NoRoleCheck, Role, TestDbHandle>,
         ) -> Result<impl IntoResponse, impl IntoResponse> {
-            get_user_handler::<SqlxPostGresDescriptor<TestDbHandle>, TestConfig, NoRoleCheck, Role, TestDbHandle>(token).await
+            get_user_handler::<
+                SqlxPostGresDescriptor<TestDbHandle>,
+                TestConfig,
+                NoRoleCheck,
+                Role,
+                TestDbHandle,
+            >(token)
+            .await
         }
 
         let app = Router::new().route("/users/me", get(handler));

@@ -1,8 +1,8 @@
-use sqlx::{Executor, Pool, Postgres};
 use crate::auth::dal::model::AuthSession;
 use crate::auth::token::checks::UserRole;
 use crate::background_tasks::dal::model::QueuedTask;
 use crate::scheduled_tasks::dal::model::ScheduledTask;
+use sqlx::{Executor, Pool, Postgres};
 
 /// Runs all framework migrations against the provided connection pool.
 ///
@@ -14,13 +14,19 @@ pub async fn run_migrations(pool: &Pool<Postgres>) {
     // same regardless of the type parameter — it's a static string.
     // Use a dummy type to call it.
     let sql = AuthSession::<DummyRole>::generate_migration_sql();
-    pool.execute(sql).await.expect("failed to run saps migrations");
-    
+    pool.execute(sql)
+        .await
+        .expect("failed to run saps migrations");
+
     let sql = QueuedTask::generate_migration_sql();
-    pool.execute(sql).await.expect("failed to run saps migrations");
+    pool.execute(sql)
+        .await
+        .expect("failed to run saps migrations");
 
     let sql = ScheduledTask::generate_migration_sql();
-    pool.execute(sql).await.expect("failed to run saps migrations");
+    pool.execute(sql)
+        .await
+        .expect("failed to run saps migrations");
 }
 
 /// Internal dummy role type used only to satisfy the generic bound on `AuthSession`

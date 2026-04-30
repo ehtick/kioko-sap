@@ -42,7 +42,6 @@ use crate::scheduled_tasks::dal::{
     tx_definitions::{GetDueScheduledTasks, PostScheduledTask},
 };
 
-
 /// A single-actor scheduler that polls `saps.scheduled_tasks` on a fixed
 /// interval and posts due rows onto `saps.queued_tasks`.
 ///
@@ -55,7 +54,6 @@ pub struct Scheduler<Y: YieldPostGresPool + Sync + Send> {
     /// `JoinHandle` of the spawned actor task, populated by [`init`](Self::init).
     handle: Option<JoinHandle<()>>,
 }
-
 
 impl<Y: YieldPostGresPool + Sync + Send + 'static> Scheduler<Y> {
     /// Creates a new `Scheduler` polling every 5 minutes.
@@ -84,7 +82,6 @@ impl<Y: YieldPostGresPool + Sync + Send + 'static> Scheduler<Y> {
     }
 }
 
-
 /// The actor's main loop. Runs forever, logging and continuing on every error.
 async fn scheduler_cycle<Z: YieldPostGresPool + Sync + Send>(interval: usize) {
     tracing::info!("scheduler starting (interval = {}s)", interval);
@@ -106,13 +103,18 @@ async fn scheduler_cycle<Z: YieldPostGresPool + Sync + Send>(interval: usize) {
                 Err(error) => {
                     tracing::error!(
                         "scheduler bad cron '{}' on row id {}: {}",
-                        task.cron_string, task.id, error
+                        task.cron_string,
+                        task.id,
+                        error
                     );
                     continue;
                 }
             };
 
-            let next = schedule.upcoming(chrono::Utc).next().map(|dt| dt.naive_utc());
+            let next = schedule
+                .upcoming(chrono::Utc)
+                .next()
+                .map(|dt| dt.naive_utc());
             let now = chrono::Utc::now().naive_utc();
 
             let updated = ScheduledTask {
@@ -123,7 +125,9 @@ async fn scheduler_cycle<Z: YieldPostGresPool + Sync + Send>(interval: usize) {
             };
             let row_id = updated.id;
 
-            if let Err(error) = ScheduledTaskPostGresDescriptor::<Z>::post_scheduled_task(updated).await {
+            if let Err(error) =
+                ScheduledTaskPostGresDescriptor::<Z>::post_scheduled_task(updated).await
+            {
                 tracing::error!("scheduler error posting row id {}: {}", row_id, error);
                 // Row is left with locked = TRUE; next tick will skip it until
                 // the lock is manually cleared.

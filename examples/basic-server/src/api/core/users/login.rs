@@ -1,3 +1,4 @@
+use crate::dal::models::users::tx_definitions::GetUserByEmail;
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use saps::auth::dal::model::AuthSession;
 use saps::auth::dal::tx_definitions::CreateAuthSession;
@@ -5,7 +6,6 @@ use saps::auth::token::checks::{CheckUserRole, UserRole};
 use saps::auth::token::header_token::HeaderToken;
 use saps::config::GetConfigVariable;
 use saps::errors::saps::SapsError;
-use crate::dal::models::users::tx_definitions::GetUserByEmail;
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -28,9 +28,7 @@ pub struct LoginResponse {
 /// Fetches the user by email via the GetUserByEmail transaction, verifies the password,
 /// creates an AuthSession with the role and user_id in meta, then encodes a HeaderToken.
 #[allow(dead_code)]
-pub async fn login<X, C, Y, R>(
-    request: LoginRequest,
-) -> Result<LoginResponse, SapsError>
+pub async fn login<X, C, Y, R>(request: LoginRequest) -> Result<LoginResponse, SapsError>
 where
     X: GetUserByEmail + CreateAuthSession,
     C: GetConfigVariable,
@@ -43,8 +41,8 @@ where
         .ok_or_else(|| SapsError::unauthorized("Invalid email or password"))?;
 
     // Verify password
-    let parsed_hash = PasswordHash::new(&user.password_hash)
-        .map_err(|e| SapsError::unknown(e.to_string()))?;
+    let parsed_hash =
+        PasswordHash::new(&user.password_hash).map_err(|e| SapsError::unknown(e.to_string()))?;
     Argon2::default()
         .verify_password(request.password.as_bytes(), &parsed_hash)
         .map_err(|_| SapsError::unauthorized("Invalid email or password"))?;
@@ -56,15 +54,16 @@ where
     Y::check_user_role(&role)?;
 
     // Create auth session with user_id in meta
-    let session = AuthSession::new(role.clone())
-        .with_meta(serde_json::json!({ "user_id": user.id }));
+    let session =
+        AuthSession::new(role.clone()).with_meta(serde_json::json!({ "user_id": user.id }));
 
     let created = X::create_auth_session(session).await?;
 
     // Create token with unique_id = session UUID
     // Note: we need a YieldPostGresPool type for HeaderToken but X is trait-based.
     // We use a dummy pool type since encode/decode don't touch the pool.
-    let token: HeaderToken<C, Y, R, saps::dal::connections::MockDeadPostGresPool> = HeaderToken::new::<R>()?.set_uuid(&created.id);
+    let token: HeaderToken<C, Y, R, saps::dal::connections::MockDeadPostGresPool> =
+        HeaderToken::new::<R>()?.set_uuid(&created.id);
     let encoded = token.encode()?;
 
     Ok(LoginResponse {
@@ -77,9 +76,9 @@ where
 mod tests {
     use super::*;
     use crate::api::core::users::create::{NewUser, create_user};
-    use saps::auth::dal::tx_definitions::GetAllAuthSessions;
-    use saps::dal::connections::{SqlxPostGresDescriptor, AuthPostGresDescriptor};
     use crate::roles::Role;
+    use saps::auth::dal::tx_definitions::GetAllAuthSessions;
+    use saps::dal::connections::{AuthPostGresDescriptor, SqlxPostGresDescriptor};
 
     // SqlxPostGresDescriptor<TestDbHandle> implements both CreateUser and GetUserByEmail (from postgres_txs).
     // AuthPostGresDescriptor<TestDbHandle> implements CreateAuthSession (from saps).
@@ -103,32 +102,41 @@ mod tests {
             password: "mypassword".to_string(),
         };
         create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
 
         // For login, we need a type that implements both GetUserByEmail + CreateAuthSession.
         // SqlxPostGresDescriptor has GetUserByEmail, AuthPostGresDescriptor has CreateAuthSession.
         // We can't merge them easily. Instead, let's call the DB operations directly to test the logic.
 
         // Fetch user
-        let user = SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("login@example.com".into())
-            .await.expect("get user")
-            .expect("user exists");
+        let user =
+            SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("login@example.com".into())
+                .await
+                .expect("get user")
+                .expect("user exists");
         assert_eq!(user.email, "login@example.com");
 
         // Verify password works
         let parsed = PasswordHash::new(&user.password_hash).unwrap();
-        assert!(Argon2::default().verify_password(b"mypassword", &parsed).is_ok());
+        assert!(
+            Argon2::default()
+                .verify_password(b"mypassword", &parsed)
+                .is_ok()
+        );
 
         // Create session
         let role = Role::try_from("admin".to_string()).unwrap();
-        let session = AuthSession::new(role)
-            .with_meta(serde_json::json!({ "user_id": user.id.to_string() }));
+        let session =
+            AuthSession::new(role).with_meta(serde_json::json!({ "user_id": user.id.to_string() }));
         let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("create session");
+            .await
+            .expect("create session");
         assert_eq!(created.role, Role::Admin);
 
         let sessions = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<Role>()
-            .await.expect("get sessions");
+            .await
+            .expect("get sessions");
         assert_eq!(sessions.len(), 1);
     }
 
@@ -141,21 +149,30 @@ mod tests {
             password: "correct".to_string(),
         };
         create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
 
-        let user = SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("wrongpw@example.com".into())
-            .await.expect("get user")
-            .expect("user exists");
+        let user =
+            SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("wrongpw@example.com".into())
+                .await
+                .expect("get user")
+                .expect("user exists");
 
         let parsed = PasswordHash::new(&user.password_hash).unwrap();
-        assert!(Argon2::default().verify_password(b"incorrect", &parsed).is_err());
+        assert!(
+            Argon2::default()
+                .verify_password(b"incorrect", &parsed)
+                .is_err()
+        );
     }
 
     #[saps::db_test]
     async fn test_login_user_not_found() {
         crate::migrations::run_migrations(pool).await;
-        let result = SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("noone@example.com".into())
-            .await.expect("query");
+        let result =
+            SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("noone@example.com".into())
+                .await
+                .expect("query");
         assert!(result.is_none());
     }
 }

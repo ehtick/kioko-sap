@@ -68,30 +68,9 @@
 //! let decoded = AdminToken::decode(&jwt_string).unwrap();
 //! assert_eq!(decoded.unique_id.len(), 36); // UUID format
 //! ```
-use std::marker::PhantomData;
-use axum::{
-    extract::FromRequestParts,
-    http::{
-        header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
-        request::Parts,
-        HeaderMap,
-    },
-};
-use chrono::{DateTime, Utc};
-use jsonwebtoken::{
-    decode,
-    encode,
-    Algorithm,
-    DecodingKey,
-    EncodingKey,
-    Header,
-    Validation,
-};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use crate::{
     auth::{
-        dal::tx_definitions::{PingAuthSession, DeleteAuthSession},
+        dal::tx_definitions::{DeleteAuthSession, PingAuthSession},
         middleware::CookieSlot,
         token::{
             checks::{CheckUserRole, UserRole},
@@ -103,7 +82,19 @@ use crate::{
     dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
     errors::saps::SapsError,
 };
-
+use axum::{
+    extract::FromRequestParts,
+    http::{
+        HeaderMap,
+        header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
+        request::Parts,
+    },
+};
+use chrono::{DateTime, Utc};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
+use uuid::Uuid;
 
 /// A `Set-Cookie` value produced by the extractor when the stored procedure
 /// regenerates the session UUID (because `date_created` was older than 5 minutes).
@@ -120,7 +111,6 @@ use crate::{
 /// your handler instead.
 #[derive(Debug, Clone)]
 pub struct UpdatedAuthCookie(pub String);
-
 
 /// A JWT authentication token that doubles as an axum request extractor.
 ///
@@ -178,8 +168,9 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     pub old_uuid: Option<String>,
 }
 
-impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> HeaderToken<X, Y, R, Z> {
-
+impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
+    HeaderToken<X, Y, R, Z>
+{
     /// Creates a new token with a random UUID and an expiry derived from config.
     ///
     /// Reads `TOKEN_EXPIRE_MINS` from the config provider `X` and sets `time_expire`
@@ -195,10 +186,11 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
     /// - `TOKEN_EXPIRE_MINS` is not set in the config provider.
     /// - `TOKEN_EXPIRE_MINS` cannot be parsed as an `i64`.
     pub fn new<U: UserRole>() -> Result<Self, SapsError> {
-        let token_expire_mins = match X::get_config_variable("TOKEN_EXPIRE_MINS".into())?.parse::<i64>() {
-            Ok(num) => num,
-            Err(error) => return Err(SapsError::unknown(error.to_string()))
-        };
+        let token_expire_mins =
+            match X::get_config_variable("TOKEN_EXPIRE_MINS".into())?.parse::<i64>() {
+                Ok(num) => num,
+                Err(error) => return Err(SapsError::unknown(error.to_string())),
+            };
         Ok(HeaderToken {
             unique_id: Uuid::new_v4().to_string(),
             time_expire: Utc::now() + chrono::Duration::minutes(token_expire_mins),
@@ -212,10 +204,10 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
     }
 
     /// Sets the id. This is used if tethering the token to an auth session.
-    /// 
+    ///
     /// # Arguments
     /// - `id`: The id to be attached to the `self.unique_id`
-    /// 
+    ///
     /// # Returns
     /// The constructed header token
     pub fn set_uuid(mut self, id: &Uuid) -> Self {
@@ -247,7 +239,9 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
     ///
     /// Returns [`SapsError::bad_request`] if `meta` is `None`.
     pub fn get_meta(&self) -> Result<&serde_json::Value, SapsError> {
-        self.meta.as_ref().ok_or_else(|| SapsError::bad_request("session meta not present"))
+        self.meta
+            .as_ref()
+            .ok_or_else(|| SapsError::bad_request("session meta not present"))
     }
 
     /// Deletes the auth session associated with this token from the database.
@@ -407,9 +401,9 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
     pub fn extract_bearer_token(headers: &HeaderMap) -> Result<String, SapsError> {
         // Prefer subprotocol: Sec-WebSocket-Protocol: bearer, <JWT>
         if let Some(raw) = headers.get(SEC_WEBSOCKET_PROTOCOL) {
-            let s = raw.to_str().map_err(|_| {
-                SapsError::unauthorized("Invalid Sec-WebSocket-Protocol header")
-            })?;
+            let s = raw
+                .to_str()
+                .map_err(|_| SapsError::unauthorized("Invalid Sec-WebSocket-Protocol header"))?;
 
             if let Some((p1, p2)) = s.split_once(',')
                 && p1.trim().eq_ignore_ascii_case("bearer")
@@ -465,7 +459,6 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> 
     }
 }
 
-
 /// Axum [`FromRequestParts`] implementation that performs the full authentication flow.
 ///
 /// When `HeaderToken` is used as a handler parameter, this implementation runs before
@@ -494,7 +487,7 @@ where
     X: GetConfigVariable + Send + Sync,
     Y: CheckUserRole + Send + Sync,
     Z: YieldPostGresPool + Send + Sync,
-    R: UserRole + Send + Sync
+    R: UserRole + Send + Sync,
 {
     type Rejection = SapsError;
 
@@ -533,10 +526,13 @@ where
         // Ping the session to keep it alive and check if it still exists.
         // Sessions inactive for more than 10 minutes are deleted by the stored procedure.
         let session = match AuthPostGresDescriptor::<Z>::ping_auth_session::<R>(
-            10, &token.unique_id
-        ).await? {
+            10,
+            &token.unique_id,
+        )
+        .await?
+        {
             Some(session) => session,
-            None => return Err(SapsError::unauthorized("session not present"))
+            None => return Err(SapsError::unauthorized("session not present")),
         };
 
         // Verify the session's role satisfies the check strategy Y.
@@ -571,16 +567,12 @@ where
 mod tests {
     use super::*;
     use crate::auth::dal::tx_definitions::CreateAuthSession;
-    use crate::{
-        auth::dal::{
-            model::AuthSession,
-        },
-        dal::connections::MockDeadPostGresPool,
-        errors::saps::SapsErrorStatus,
-    };
     use crate::auth::token::checks::{
-        AdminRoleCheck, CustomerRoleCheck, ExactAdminRoleCheck, NoRoleCheck,
-        SuperAdminRoleCheck,
+        AdminRoleCheck, CustomerRoleCheck, ExactAdminRoleCheck, NoRoleCheck, SuperAdminRoleCheck,
+    };
+    use crate::{
+        auth::dal::model::AuthSession, dal::connections::MockDeadPostGresPool,
+        errors::saps::SapsErrorStatus,
     };
     use axum::{
         Json, Router,
@@ -633,7 +625,10 @@ mod tests {
             match variable.as_str() {
                 "SECRET_KEY" => Ok("test_secret".to_string()),
                 "TOKEN_EXPIRE_MINS" => Ok("20".to_string()),
-                _ => Err(SapsError::unknown(format!("key: {} was not found", variable))),
+                _ => Err(SapsError::unknown(format!(
+                    "key: {} was not found",
+                    variable
+                ))),
             }
         }
     }
@@ -643,7 +638,8 @@ mod tests {
 
     // -- Helper to construct a token --
     fn construct_token() -> TkNo {
-        HeaderToken::<FakeConfig, NoRoleCheck, TestRole, MockDeadPostGresPool>::new::<TestRole>().unwrap()
+        HeaderToken::<FakeConfig, NoRoleCheck, TestRole, MockDeadPostGresPool>::new::<TestRole>()
+            .unwrap()
     }
 
     // -- Handlers --
@@ -721,7 +717,10 @@ mod tests {
     #[test]
     fn test_wrong_scheme_is_unauthorized() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic Zm9vOmJhcg=="));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic Zm9vOmJhcg=="),
+        );
         let err = TkNo::extract_bearer_token(&headers).expect_err("expected error");
         assert_eq!(err.status, SapsErrorStatus::Unauthorized);
         assert!(err.message.contains("Expected 'Bearer <token>'"));
@@ -738,7 +737,10 @@ mod tests {
     #[test]
     fn ws_subprotocol_bearer_simple() {
         let mut headers = HeaderMap::new();
-        headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("bearer, jwt123"));
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("bearer, jwt123"),
+        );
         let token = TkNo::extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "jwt123");
     }
@@ -746,7 +748,10 @@ mod tests {
     #[test]
     fn ws_subprotocol_bearer_case_insensitive_and_spaces() {
         let mut headers = HeaderMap::new();
-        headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("BeArEr,    42-XYZ "));
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("BeArEr,    42-XYZ "),
+        );
         let token = TkNo::extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "42-XYZ");
     }
@@ -768,13 +773,13 @@ mod tests {
     #[tokio::test]
     async fn test_fail_no_token() {
         let app = Router::new().route("/", get(pass_handle));
-        let req = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         let (status, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, Bytes::from_static(b"\"Missing Authorization header\""));
+        assert_eq!(
+            body,
+            Bytes::from_static(b"\"Missing Authorization header\"")
+        );
     }
 
     // ===== Handler + extractor tests via #[db_test] =====
@@ -812,11 +817,36 @@ mod tests {
         };
     }
 
-    db_handler_test!(test_pass_no_role_check, NoRoleCheck, TestRole::Admin, StatusCode::OK);
-    db_handler_test!(test_pass_admin_check, AdminRoleCheck, TestRole::Admin, StatusCode::OK);
-    db_handler_test!(test_pass_customer_check, CustomerRoleCheck, TestRole::Admin, StatusCode::OK);
-    db_handler_test!(test_fail_super_admin_check, SuperAdminRoleCheck, TestRole::Admin, StatusCode::UNAUTHORIZED);
-    db_handler_test!(test_pass_exact_admin_check, ExactAdminRoleCheck, TestRole::Admin, StatusCode::OK);
+    db_handler_test!(
+        test_pass_no_role_check,
+        NoRoleCheck,
+        TestRole::Admin,
+        StatusCode::OK
+    );
+    db_handler_test!(
+        test_pass_admin_check,
+        AdminRoleCheck,
+        TestRole::Admin,
+        StatusCode::OK
+    );
+    db_handler_test!(
+        test_pass_customer_check,
+        CustomerRoleCheck,
+        TestRole::Admin,
+        StatusCode::OK
+    );
+    db_handler_test!(
+        test_fail_super_admin_check,
+        SuperAdminRoleCheck,
+        TestRole::Admin,
+        StatusCode::UNAUTHORIZED
+    );
+    db_handler_test!(
+        test_pass_exact_admin_check,
+        ExactAdminRoleCheck,
+        TestRole::Admin,
+        StatusCode::OK
+    );
 
     // ===== Named handler tests using TkAdm/TkSup/TkCus/TkExa =====
     // These use the db_handler_test macro with explicit handler functions and the
@@ -834,7 +864,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::Admin);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new().route("/", get(handler));
         let req = Request::builder()
@@ -856,7 +887,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::Customer);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new().route("/", get(handler));
         let req = Request::builder()
@@ -866,7 +898,10 @@ mod tests {
             .unwrap();
         let (status, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, Bytes::from_static(b"\"Role does not have sufficient permissions\""));
+        assert_eq!(
+            body,
+            Bytes::from_static(b"\"Role does not have sufficient permissions\"")
+        );
     }
 
     #[saps::db_test]
@@ -880,7 +915,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::SuperAdmin);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new().route("/", get(handler));
         let req = Request::builder()
@@ -902,7 +938,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::Admin);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new().route("/", get(handler));
         let req = Request::builder()
@@ -912,7 +949,10 @@ mod tests {
             .unwrap();
         let (status, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, Bytes::from_static(b"\"Role does not have sufficient permissions\""));
+        assert_eq!(
+            body,
+            Bytes::from_static(b"\"Role does not have sufficient permissions\"")
+        );
     }
 
     #[saps::db_test]
@@ -927,7 +967,8 @@ mod tests {
             let mut session = AuthSession::new(role);
             session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
             AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-                .await.expect("failed to create session");
+                .await
+                .expect("failed to create session");
 
             let app = Router::new().route("/", get(handler));
             let req = Request::builder()
@@ -950,7 +991,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::SuperAdmin);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new().route("/", get(handler));
         let req = Request::builder()
@@ -960,7 +1002,10 @@ mod tests {
             .unwrap();
         let (status, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, Bytes::from_static(b"\"Role does not have sufficient permissions\""));
+        assert_eq!(
+            body,
+            Bytes::from_static(b"\"Role does not have sufficient permissions\"")
+        );
     }
 
     #[saps::db_test]
@@ -974,7 +1019,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::Customer);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new().route("/", get(handler));
         let req = Request::builder()
@@ -984,7 +1030,10 @@ mod tests {
             .unwrap();
         let (status, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, Bytes::from_static(b"\"Role does not have sufficient permissions\""));
+        assert_eq!(
+            body,
+            Bytes::from_static(b"\"Role does not have sufficient permissions\"")
+        );
     }
 
     // ===== Rotation + cookie attachment integration test =====
@@ -1023,7 +1072,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::Admin);
         session.id = uuid::Uuid::parse_str(&original_uuid).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         // 2. Backdate date_created so the ping triggers a rotation.
         saps::sqlx::query("UPDATE saps.auth_sessions SET date_created = NOW() - INTERVAL '6 minutes' WHERE id = $1")
@@ -1060,7 +1110,8 @@ mod tests {
         assert!(
             set_cookie.starts_with(&format!("{}=", AUTH_TOKEN_COOKIE_KEY)),
             "expected cookie to start with {}=, got {:?}",
-            AUTH_TOKEN_COOKIE_KEY, set_cookie,
+            AUTH_TOKEN_COOKIE_KEY,
+            set_cookie,
         );
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("Path=/"));
@@ -1077,8 +1128,14 @@ mod tests {
 
         // 7. The handler saw old_uuid populated with the pre-rotation UUID.
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body_json["old_uuid"], serde_json::Value::String(original_uuid.clone()));
-        assert_eq!(body_json["unique_id"], serde_json::Value::String(decoded.unique_id));
+        assert_eq!(
+            body_json["old_uuid"],
+            serde_json::Value::String(original_uuid.clone())
+        );
+        assert_eq!(
+            body_json["unique_id"],
+            serde_json::Value::String(decoded.unique_id)
+        );
     }
 
     #[saps::db_test]
@@ -1100,7 +1157,8 @@ mod tests {
         let mut session = AuthSession::new(TestRole::Admin);
         session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
         AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("failed to create session");
+            .await
+            .expect("failed to create session");
 
         let app = Router::new()
             .route("/", get(handler))

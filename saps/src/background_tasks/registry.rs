@@ -52,13 +52,12 @@
 //!
 //! [`background_task`]: https://docs.rs/saps_background_task
 
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::future::Future;
-use std::sync::{LazyLock, RwLock};
-use serde_json::Value;
 use crate::errors::saps::SapsError;
-
+use serde_json::Value;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{LazyLock, RwLock};
 
 /// The signature every registered background task handler must match.
 ///
@@ -94,8 +93,10 @@ use crate::errors::saps::SapsError;
 /// before awaiting. A `Box<dyn Fn>` would require either `Arc` cloning or
 /// holding the guard across the await — both more expensive and the latter
 /// outright impossible (`RwLockReadGuard` is `!Send`).
-pub type TaskFnPtr = fn(Value, &'static sqlx::Pool<sqlx::Postgres>) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send>>;
-
+pub type TaskFnPtr = fn(
+    Value,
+    &'static sqlx::Pool<sqlx::Postgres>,
+) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send>>;
 
 /// A name + handler pair describing a single background task.
 ///
@@ -111,7 +112,6 @@ pub struct BackgroundTaskEntry {
     /// is claimed from the queue. See [`TaskFnPtr`] for the exact signature.
     pub handler: TaskFnPtr,
 }
-
 
 /// Process-wide map from task name to handler function.
 ///
@@ -183,6 +183,5 @@ pub struct BackgroundTaskEntry {
 /// // guard is gone here — safe to .await
 /// handler(serde_json::json!({}), pool).await?;
 /// ```
-pub static TASK_REGISTRY: LazyLock<RwLock<HashMap<String, TaskFnPtr>>> = LazyLock::new(||{
-    RwLock::new(HashMap::new())
-});
+pub static TASK_REGISTRY: LazyLock<RwLock<HashMap<String, TaskFnPtr>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));

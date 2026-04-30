@@ -1,6 +1,6 @@
-use saps::errors::saps::SapsError;
 use crate::api::core::users::create::UserResponse;
 use crate::dal::models::users::tx_definitions::GetUserById;
+use saps::errors::saps::SapsError;
 
 /// Gets a user profile by extracting the user_id from the session meta.
 ///
@@ -11,10 +11,12 @@ pub async fn get_user<X: GetUserById>(
 ) -> Result<UserResponse, SapsError> {
     // Extract user_id from session meta
     let meta = meta.ok_or_else(|| SapsError::bad_request("session has no meta"))?;
-    let user_id_str = meta.get("user_id")
+    let user_id_str = meta
+        .get("user_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| SapsError::bad_request("meta missing user_id"))?;
-    let user_id: uuid::Uuid = user_id_str.parse()
+    let user_id: uuid::Uuid = user_id_str
+        .parse()
         .map_err(|_| SapsError::bad_request("invalid user_id in meta"))?;
 
     // Fetch user by ID
@@ -49,17 +51,20 @@ mod tests {
             password: "password".to_string(),
         };
         let created = create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
 
         // Create a session with user_id in meta
         let session = AuthSession::new(Role::Admin)
             .with_meta(serde_json::json!({ "user_id": created.id.to_string() }));
         let created_session = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("create session");
+            .await
+            .expect("create session");
 
         // Get user via session meta
         let user = get_user::<SqlxPostGresDescriptor<TestDbHandle>>(created_session.meta)
-            .await.expect("get user");
+            .await
+            .expect("get user");
         assert_eq!(user.id, created.id);
         assert_eq!(user.username, "getuser");
         assert_eq!(user.email, "get@example.com");

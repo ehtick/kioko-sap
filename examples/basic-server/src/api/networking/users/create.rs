@@ -1,6 +1,6 @@
-use saps::axum::{Json, http::StatusCode, response::IntoResponse};
 use crate::api::core::users::create::{NewUser, create_user};
 use crate::dal::models::users::tx_definitions::CreateUser;
+use saps::axum::{Json, http::StatusCode, response::IntoResponse};
 
 /// POST /users — creates a new user.
 pub async fn create_user_handler<X: CreateUser>(
@@ -15,7 +15,12 @@ pub async fn create_user_handler<X: CreateUser>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saps::axum::{Router, body::{self, Body, Bytes}, http::{Request, StatusCode}, routing::post};
+    use saps::axum::{
+        Router,
+        body::{self, Body, Bytes},
+        http::{Request, StatusCode},
+        routing::post,
+    };
     use saps::dal::connections::SqlxPostGresDescriptor;
     use tower::ServiceExt;
 
@@ -29,14 +34,18 @@ mod tests {
     #[saps::db_test]
     async fn test_create_user_endpoint() {
         crate::migrations::run_migrations(pool).await;
-        let app = Router::new()
-            .route("/users", post(create_user_handler::<SqlxPostGresDescriptor<TestDbHandle>>));
+        let app = Router::new().route(
+            "/users",
+            post(create_user_handler::<SqlxPostGresDescriptor<TestDbHandle>>),
+        );
 
         let req = Request::builder()
             .method("POST")
             .uri("/users")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"username":"httpuser","email":"http@example.com","password":"pass123"}"#))
+            .body(Body::from(
+                r#"{"username":"httpuser","email":"http@example.com","password":"pass123"}"#,
+            ))
             .unwrap();
 
         let (status, body) = send(&app, req).await;
@@ -50,8 +59,10 @@ mod tests {
     #[saps::db_test]
     async fn test_create_duplicate_user_endpoint() {
         crate::migrations::run_migrations(pool).await;
-        let app = Router::new()
-            .route("/users", post(create_user_handler::<SqlxPostGresDescriptor<TestDbHandle>>));
+        let app = Router::new().route(
+            "/users",
+            post(create_user_handler::<SqlxPostGresDescriptor<TestDbHandle>>),
+        );
 
         let body_json = r#"{"username":"dup","email":"dup@example.com","password":"pass"}"#;
 

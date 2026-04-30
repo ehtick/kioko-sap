@@ -1,10 +1,8 @@
-use syn::{FnArg, Pat, punctuated::Punctuated, token::Comma};
-use quote::quote;
 use proc_macro2::TokenStream;
-
+use quote::quote;
+use syn::{FnArg, Pat, punctuated::Punctuated, token::Comma};
 
 pub fn generate_extract_inputs(inputs: &Punctuated<FnArg, Comma>) -> TokenStream {
-
     let mut param_names = Vec::new();
     let mut param_idents = Vec::new();
     let mut param_types = Vec::new();

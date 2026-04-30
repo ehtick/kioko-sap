@@ -1,7 +1,6 @@
-use syn::{FnArg, Pat, punctuated::Punctuated, token::Comma};
-use quote::quote;
 use proc_macro2::TokenStream;
-
+use quote::quote;
+use syn::{FnArg, Pat, punctuated::Punctuated, token::Comma};
 
 /// Generates a `TokenStream` that packages all typed function parameters into
 /// a `saps::Value::Object(map)` stored in a variable called `__saps_params`.
@@ -15,14 +14,12 @@ use proc_macro2::TokenStream;
 /// let __saps_params = saps::Value::Object(__saps_map);
 /// ```
 pub fn generate_package_inputs(inputs: &Punctuated<FnArg, Comma>) -> TokenStream {
-    
     // define the buffers
     let mut param_idents = Vec::new();
     let mut param_names = Vec::new();
 
     // loop through the inputs and package them to the buffers
     for arg in inputs {
-
         // only package if a typed input
         if let FnArg::Typed(pat_type) = arg {
             if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {

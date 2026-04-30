@@ -1,9 +1,9 @@
-use saps::axum::{Json, http::StatusCode, response::IntoResponse};
-use saps::auth::dal::tx_definitions::CreateAuthSession;
-use saps::auth::token::checks::{CheckUserRole, UserRole};
-use saps::config::GetConfigVariable;
 use crate::api::core::users::login::{LoginRequest, login};
 use crate::dal::models::users::tx_definitions::GetUserByEmail;
+use saps::auth::dal::tx_definitions::CreateAuthSession;
+use saps::auth::token::checks::{CheckUserRole, UserRole};
+use saps::axum::{Json, http::StatusCode, response::IntoResponse};
+use saps::config::GetConfigVariable;
 
 /// POST /login — authenticates a user and returns a JWT token.
 #[allow(dead_code)]

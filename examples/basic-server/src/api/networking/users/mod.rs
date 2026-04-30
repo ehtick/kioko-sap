@@ -4,13 +4,15 @@ pub mod get;
 pub mod login;
 pub mod logout;
 
+use crate::roles::{NoRoleCheck, Role};
 use saps::auth::middleware::attach_refreshed_cookie;
-use saps::axum::{Router, middleware::from_fn, routing::{get, post, delete as delete_method}};
-use saps::config::GetConfigVariable;
-use saps::dal::connections::{
-    LivePostGresPool, SqlxPostGresDescriptor, AuthPostGresDescriptor,
+use saps::axum::{
+    Router,
+    middleware::from_fn,
+    routing::{delete as delete_method, get, post},
 };
-use crate::roles::{Role, NoRoleCheck};
+use saps::config::GetConfigVariable;
+use saps::dal::connections::{AuthPostGresDescriptor, LivePostGresPool, SqlxPostGresDescriptor};
 
 /// Attaches all user-related views to the router.
 ///
@@ -28,21 +30,17 @@ where
 {
     app.route(
         "/api/v1/users",
-        post(
-            create::create_user_handler::<SqlxPostGresDescriptor<LivePostGresPool>>,
-        ),
+        post(create::create_user_handler::<SqlxPostGresDescriptor<LivePostGresPool>>),
     )
     .route(
         "/api/v1/users/me",
-        get(
-            get::get_user_handler::<
-                SqlxPostGresDescriptor<LivePostGresPool>,
-                C,
-                NoRoleCheck,
-                Role,
-                LivePostGresPool,
-            >,
-        ),
+        get(get::get_user_handler::<
+            SqlxPostGresDescriptor<LivePostGresPool>,
+            C,
+            NoRoleCheck,
+            Role,
+            LivePostGresPool,
+        >),
     )
     .route(
         "/api/v1/auth/logout",

@@ -14,7 +14,7 @@ mod tests {
     use crate::roles::Role;
     use saps::auth::dal::model::AuthSession;
     use saps::auth::dal::tx_definitions::{CreateAuthSession, GetAllAuthSessions};
-    use saps::dal::connections::{SqlxPostGresDescriptor, AuthPostGresDescriptor};
+    use saps::dal::connections::{AuthPostGresDescriptor, SqlxPostGresDescriptor};
 
     #[saps::db_test]
     async fn test_logout_deletes_session() {
@@ -26,24 +26,29 @@ mod tests {
             password: "password".to_string(),
         };
         create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
 
         // Create a session
         let session = AuthSession::new(Role::Admin);
         let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("create session");
+            .await
+            .expect("create session");
 
         let sessions = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<Role>()
-            .await.expect("get sessions");
+            .await
+            .expect("get sessions");
         assert_eq!(sessions.len(), 1);
 
         // Logout
         let deleted = logout::<AuthPostGresDescriptor<TestDbHandle>>(created.id)
-            .await.expect("logout");
+            .await
+            .expect("logout");
         assert!(deleted);
 
         let sessions = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<Role>()
-            .await.expect("get sessions");
+            .await
+            .expect("get sessions");
         assert_eq!(sessions.len(), 0);
     }
 
@@ -51,7 +56,8 @@ mod tests {
     async fn test_logout_nonexistent_returns_false() {
         let fake_id = uuid::Uuid::new_v4();
         let deleted = logout::<AuthPostGresDescriptor<TestDbHandle>>(fake_id)
-            .await.expect("logout");
+            .await
+            .expect("logout");
         assert!(!deleted);
     }
 }

@@ -52,9 +52,9 @@
 //! AuthTokenCookie::from(token).add_to_headers(&mut headers)?;
 //! ```
 
-use axum::http::{HeaderMap, HeaderValue, header};
 use crate::constants::AUTH_TOKEN_COOKIE_KEY;
 use crate::errors::saps::SapsError;
+use axum::http::{HeaderMap, HeaderValue, header};
 
 /// A borrowed view over an auth token, used to produce the matching `Set-Cookie` header.
 ///
@@ -70,12 +70,10 @@ use crate::errors::saps::SapsError;
 /// See the [module-level documentation](self) for the cookie attribute set used.
 pub struct AuthTokenCookie<'a> {
     /// The auth token to embed in the cookie value. Borrowed for the lifetime of the wrapper.
-    token: &'a str
+    token: &'a str,
 }
 
-
-impl <'a>AuthTokenCookie<'a> {
-
+impl<'a> AuthTokenCookie<'a> {
     /// Builds the raw `Set-Cookie` value for the wrapped token.
     ///
     /// Format: `"{AUTH_TOKEN_COOKIE_KEY}={token}; HttpOnly; Path=/; Max-Age=86400"`
@@ -105,7 +103,8 @@ impl <'a>AuthTokenCookie<'a> {
     pub fn add_to_headers(&self, headers: &mut HeaderMap) -> Result<(), SapsError> {
         headers.insert(
             header::SET_COOKIE,
-            HeaderValue::from_str(&self.yield_cookie_string()).map_err(|e| SapsError::unknown(e.to_string()))?,
+            HeaderValue::from_str(&self.yield_cookie_string())
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
         );
         Ok(())
     }
@@ -144,31 +143,27 @@ impl <'a>AuthTokenCookie<'a> {
         );
         Ok(headers)
     }
-
 }
-
 
 /// Borrows from an owned `String` to produce an `AuthTokenCookie`.
 ///
 /// The resulting wrapper's lifetime is bound to the borrow, so the source `String`
 /// must outlive any use of the cookie.
 impl<'a> From<&'a String> for AuthTokenCookie<'a> {
-
     fn from(value: &'a String) -> Self {
-        Self { token: value.as_str() }
+        Self {
+            token: value.as_str(),
+        }
     }
-
 }
 
 /// Borrows from a `&str` to produce an `AuthTokenCookie`.
 ///
 /// This is the most common entry point — pass the JWT slice directly.
 impl<'a> From<&'a str> for AuthTokenCookie<'a> {
-
     fn from(value: &'a str) -> Self {
         Self { token: value }
     }
-
 }
 
 #[cfg(test)]
@@ -223,7 +218,10 @@ mod tests {
     #[test]
     fn add_to_headers_preserves_unrelated_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
 
         AuthTokenCookie::from(TOKEN)
             .add_to_headers(&mut headers)
@@ -239,10 +237,7 @@ mod tests {
     #[test]
     fn add_to_headers_replaces_prior_set_cookie() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::SET_COOKIE,
-            HeaderValue::from_static("other=value"),
-        );
+        headers.insert(header::SET_COOKIE, HeaderValue::from_static("other=value"));
 
         AuthTokenCookie::from(TOKEN)
             .add_to_headers(&mut headers)

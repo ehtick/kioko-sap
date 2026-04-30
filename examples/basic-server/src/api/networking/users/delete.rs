@@ -1,15 +1,14 @@
+use crate::{
+    api::core::users::delete::delete_user, dal::models::users::tx_definitions::DeleteUser,
+};
 use saps::{
     auth::token::{
         checks::{CheckUserRole, UserRole},
         header_token::HeaderToken,
     },
-    axum::{http::StatusCode, response::IntoResponse, Json},
+    axum::{Json, http::StatusCode, response::IntoResponse},
     config::GetConfigVariable,
     dal::connections::YieldPostGresPool,
-};
-use crate::{
-    api::core::users::delete::delete_user,
-    dal::models::users::tx_definitions::DeleteUser,
 };
 
 /// DELETE /users — deletes the caller's user account and auth session.
@@ -26,14 +25,19 @@ where
     Z: YieldPostGresPool + Send + Sync,
 {
     let meta = token.get_meta()?;
-    let user_id_str = meta.get("user_id")
+    let user_id_str = meta
+        .get("user_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| saps::errors::saps::SapsError::bad_request("meta missing user_id"))?;
-    let user_id: uuid::Uuid = user_id_str.parse()
+    let user_id: uuid::Uuid = user_id_str
+        .parse()
         .map_err(|_| saps::errors::saps::SapsError::bad_request("invalid user_id in meta"))?;
 
     let outcome = match delete_user::<X>(user_id).await {
-        Ok(_) => Ok((StatusCode::OK, Json(serde_json::json!({"message": "user deleted"})))),
+        Ok(_) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"message": "user deleted"})),
+        )),
         Err(e) => Err(e),
     };
 
@@ -48,7 +52,7 @@ mod tests {
     use crate::api::core::users::create::{NewUser, create_user};
     use crate::dal::models::users::tx_definitions::GetUserByEmail;
     use crate::roles::Role;
-    use saps::auth::dal::tx_definitions::{GetAllAuthSessions, DeleteAuthSession};
+    use saps::auth::dal::tx_definitions::{DeleteAuthSession, GetAllAuthSessions};
     use saps::dal::connections::{AuthPostGresDescriptor, SqlxPostGresDescriptor};
 
     #[saps::db_test]
@@ -64,28 +68,35 @@ mod tests {
             password: "password".to_string(),
         };
         let user = create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
 
         // Create an auth session with user_id in meta
         let session = AuthSession::new(Role::Admin)
             .with_meta(serde_json::json!({ "user_id": user.id.to_string() }));
         let created_session = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
-            .await.expect("create session");
+            .await
+            .expect("create session");
 
         // Test via core functions directly (the handler requires a unified type
         // for DeleteUser + DeleteAuthSession which are on different descriptors)
         AuthPostGresDescriptor::<TestDbHandle>::delete_auth_session(created_session.id)
-            .await.expect("delete session");
+            .await
+            .expect("delete session");
         SqlxPostGresDescriptor::<TestDbHandle>::delete_user(user.id)
-            .await.expect("delete user");
+            .await
+            .expect("delete user");
 
         // Verify both are gone
-        let found = SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("deluser@example.com".into())
-            .await.expect("query");
+        let found =
+            SqlxPostGresDescriptor::<TestDbHandle>::get_user_by_email("deluser@example.com".into())
+                .await
+                .expect("query");
         assert!(found.is_none());
 
         let sessions = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<Role>()
-            .await.expect("get sessions");
+            .await
+            .expect("get sessions");
         assert_eq!(sessions.len(), 0);
     }
 }

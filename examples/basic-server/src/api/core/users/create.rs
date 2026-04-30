@@ -1,6 +1,9 @@
-use argon2::{Argon2, PasswordHasher, password_hash::{SaltString, rand_core::OsRng}};
-use saps::errors::saps::SapsError;
 use crate::dal::models::users::tx_definitions::CreateUser;
+use argon2::{
+    Argon2, PasswordHasher,
+    password_hash::{SaltString, rand_core::OsRng},
+};
+use saps::errors::saps::SapsError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,7 +50,8 @@ mod tests {
             password: "securepassword123".to_string(),
         };
         let user = create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("create user");
+            .await
+            .expect("create user");
         assert_eq!(user.username, "testuser");
         assert_eq!(user.email, "test@example.com");
     }
@@ -61,7 +65,8 @@ mod tests {
             password: "password".to_string(),
         };
         create_user::<SqlxPostGresDescriptor<TestDbHandle>>(new_user)
-            .await.expect("first create");
+            .await
+            .expect("first create");
 
         let dup = NewUser {
             username: "duplicate".to_string(),

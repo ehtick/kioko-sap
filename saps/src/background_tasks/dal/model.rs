@@ -8,12 +8,11 @@
 //! The module also provides [`QueuedTask::generate_migration_sql`] which returns the SQL
 //! needed to create the table and a stored procedure for atomically claiming the next
 //! pending task.
+use crate::errors::saps::SapsError;
 use chrono::NaiveDateTime;
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
 use uuid::Uuid;
-use crate::errors::saps::SapsError;
-
 
 /// The lifecycle status of a queued background task.
 ///
@@ -63,11 +62,13 @@ impl TryFrom<String> for TaskStatus {
             "in_progress" => Ok(TaskStatus::InProgress),
             "completed" => Ok(TaskStatus::Completed),
             "exited" => Ok(TaskStatus::Exited),
-            _ => Err(SapsError::bad_request(format!("Unknown task status: {}", value))),
+            _ => Err(SapsError::bad_request(format!(
+                "Unknown task status: {}",
+                value
+            ))),
         }
     }
 }
-
 
 /// A background task stored in the `saps.queued_tasks` table.
 ///
@@ -116,18 +117,33 @@ impl QueuedTask {
     /// Returns [`SapsError`] if any column is missing or the `status` string
     /// does not match a known variant.
     pub fn from_row(row: &PgRow) -> Result<Self, SapsError> {
-        let status_str: String = row.try_get("status")
+        let status_str: String = row
+            .try_get("status")
             .map_err(|e| SapsError::unknown(e.to_string()))?;
         let status = TaskStatus::try_from(status_str)?;
         Ok(Self {
-            id: row.try_get("id").map_err(|e| SapsError::unknown(e.to_string()))?,
-            function_name: row.try_get("function_name").map_err(|e| SapsError::unknown(e.to_string()))?,
-            params: row.try_get("params").map_err(|e| SapsError::unknown(e.to_string()))?,
+            id: row
+                .try_get("id")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            function_name: row
+                .try_get("function_name")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            params: row
+                .try_get("params")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
             status,
-            time_posted: row.try_get("time_posted").map_err(|e| SapsError::unknown(e.to_string()))?,
-            time_started: row.try_get("time_started").map_err(|e| SapsError::unknown(e.to_string()))?,
-            time_finished: row.try_get("time_finished").map_err(|e| SapsError::unknown(e.to_string()))?,
-            locked: row.try_get("locked").map_err(|e| SapsError::unknown(e.to_string()))?,
+            time_posted: row
+                .try_get("time_posted")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            time_started: row
+                .try_get("time_started")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            time_finished: row
+                .try_get("time_finished")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            locked: row
+                .try_get("locked")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
         })
     }
 }
@@ -257,7 +273,6 @@ $$;
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,16 +310,34 @@ mod tests {
 
     #[test]
     fn test_task_status_try_from_valid() {
-        assert_eq!(TaskStatus::try_from("pending".to_string()).unwrap(), TaskStatus::Pending);
-        assert_eq!(TaskStatus::try_from("in_progress".to_string()).unwrap(), TaskStatus::InProgress);
-        assert_eq!(TaskStatus::try_from("completed".to_string()).unwrap(), TaskStatus::Completed);
-        assert_eq!(TaskStatus::try_from("exited".to_string()).unwrap(), TaskStatus::Exited);
+        assert_eq!(
+            TaskStatus::try_from("pending".to_string()).unwrap(),
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            TaskStatus::try_from("in_progress".to_string()).unwrap(),
+            TaskStatus::InProgress
+        );
+        assert_eq!(
+            TaskStatus::try_from("completed".to_string()).unwrap(),
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            TaskStatus::try_from("exited".to_string()).unwrap(),
+            TaskStatus::Exited
+        );
     }
 
     #[test]
     fn test_task_status_try_from_case_insensitive() {
-        assert_eq!(TaskStatus::try_from("PENDING".to_string()).unwrap(), TaskStatus::Pending);
-        assert_eq!(TaskStatus::try_from("In_Progress".to_string()).unwrap(), TaskStatus::InProgress);
+        assert_eq!(
+            TaskStatus::try_from("PENDING".to_string()).unwrap(),
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            TaskStatus::try_from("In_Progress".to_string()).unwrap(),
+            TaskStatus::InProgress
+        );
     }
 
     #[test]

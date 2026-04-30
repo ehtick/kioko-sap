@@ -87,31 +87,52 @@ impl SapsError {
     /// # Returns
     /// * `CustomError` - The new error.
     pub fn new(message: impl Into<String>, status: SapsErrorStatus) -> SapsError {
-        SapsError { message: message.into(), status }
+        SapsError {
+            message: message.into(),
+            status,
+        }
     }
 
     pub fn not_found(message: impl Into<String>) -> SapsError {
-        SapsError { message: message.into(), status: SapsErrorStatus::NotFound }
+        SapsError {
+            message: message.into(),
+            status: SapsErrorStatus::NotFound,
+        }
     }
 
     pub fn forbidden(message: impl Into<String>) -> SapsError {
-        SapsError { message: message.into(), status: SapsErrorStatus::Forbidden }
+        SapsError {
+            message: message.into(),
+            status: SapsErrorStatus::Forbidden,
+        }
     }
 
     pub fn unknown(message: impl Into<String>) -> SapsError {
-        SapsError { message: message.into(), status: SapsErrorStatus::Unknown }
+        SapsError {
+            message: message.into(),
+            status: SapsErrorStatus::Unknown,
+        }
     }
 
     pub fn bad_request(message: impl Into<String>) -> SapsError {
-        SapsError { message: message.into(), status: SapsErrorStatus::BadRequest }
+        SapsError {
+            message: message.into(),
+            status: SapsErrorStatus::BadRequest,
+        }
     }
 
     pub fn conflict(message: impl Into<String>) -> SapsError {
-        SapsError { message: message.into(), status: SapsErrorStatus::Conflict }
+        SapsError {
+            message: message.into(),
+            status: SapsErrorStatus::Conflict,
+        }
     }
 
     pub fn unauthorized(message: impl Into<String>) -> SapsError {
-        SapsError { message: message.into(), status: SapsErrorStatus::Unauthorized }
+        SapsError {
+            message: message.into(),
+            status: SapsErrorStatus::Unauthorized,
+        }
     }
 }
 
@@ -141,15 +162,13 @@ impl IntoResponse for SapsError {
 impl From<sqlx::Error> for SapsError {
     fn from(error: sqlx::Error) -> Self {
         match error {
-            sqlx::Error::RowNotFound => {
-                SapsError::not_found("Resource not found".to_string())
-            },
+            sqlx::Error::RowNotFound => SapsError::not_found("Resource not found".to_string()),
             sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
                 SapsError::conflict("Duplicate entry".to_string())
-            },
+            }
             sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
                 SapsError::bad_request("Foreign key constraint violation".to_string())
-            },
+            }
             _ => SapsError::unknown(format!("Database error: {}", error)),
         }
     }

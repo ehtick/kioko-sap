@@ -63,10 +63,14 @@ mod tests {
             Ok(1)
         }
         let new_user = NewUser;
-        let outcome = PostgresHandle::<MockDeadPostGresPool>::create(new_user).await.unwrap();
+        let outcome = PostgresHandle::<MockDeadPostGresPool>::create(new_user)
+            .await
+            .unwrap();
         assert_eq!(outcome, 1);
 
-        let outcome = PostgresHandle::<MockDeadPostGresPool>::delete(1).await.unwrap();
+        let outcome = PostgresHandle::<MockDeadPostGresPool>::delete(1)
+            .await
+            .unwrap();
         assert!(outcome);
     }
 }

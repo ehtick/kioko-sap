@@ -54,14 +54,9 @@
 //!     ).await
 //! }
 //! ```
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use serde::Serialize;
 use crate::{
     auth::{
-        dal::{
-            model::AuthSession,
-            tx_definitions::CreateAuthSession,
-        },
+        dal::{model::AuthSession, tx_definitions::CreateAuthSession},
         token::{
             checks::{NoRoleCheck, UserRole},
             header_token::HeaderToken,
@@ -72,7 +67,8 @@ use crate::{
     dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
     errors::saps::SapsError,
 };
-
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use serde::Serialize;
 
 /// The JSON body returned to the client on a successful login.
 ///
@@ -91,7 +87,6 @@ pub struct LoginResponse {
     /// The UUID identifying this session in the database.
     pub unique_id: String,
 }
-
 
 /// Creates a new authenticated session and returns a cookie-bearing HTTP response.
 ///
@@ -160,8 +155,8 @@ where
 
     // 2. Build an AuthSession whose primary key matches the token's UUID.
     let mut session = AuthSession::new(role);
-    session.id = uuid::Uuid::parse_str(&token.unique_id)
-        .map_err(|e| SapsError::unknown(e.to_string()))?;
+    session.id =
+        uuid::Uuid::parse_str(&token.unique_id).map_err(|e| SapsError::unknown(e.to_string()))?;
     if let Some(m) = meta {
         session = session.with_meta(m);
     }
@@ -190,7 +185,6 @@ where
     );
     Ok((StatusCode::OK, headers, axum::Json(login_response)))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -241,7 +235,10 @@ mod tests {
             match variable.as_str() {
                 "SECRET_KEY" => Ok("test_secret".to_string()),
                 "TOKEN_EXPIRE_MINS" => Ok("20".to_string()),
-                _ => Err(SapsError::unknown(format!("key: {} was not found", variable))),
+                _ => Err(SapsError::unknown(format!(
+                    "key: {} was not found",
+                    variable
+                ))),
             }
         }
     }
@@ -255,7 +252,10 @@ mod tests {
         fn get_config_variable(variable: String) -> Result<String, SapsError> {
             match variable.as_str() {
                 "SECRET_KEY" => Ok("test_secret".to_string()),
-                _ => Err(SapsError::unknown(format!("key: {} was not found", variable))),
+                _ => Err(SapsError::unknown(format!(
+                    "key: {} was not found",
+                    variable
+                ))),
             }
         }
     }
@@ -269,19 +269,21 @@ mod tests {
     async fn test_login_creates_session_without_meta() {
         // Ensure the table is empty before login.
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get sessions");
+            .await
+            .expect("failed to get sessions");
         assert_eq!(all.len(), 0);
 
-        let (status, headers, body) = login::<FakeConfig, TestRole, TestDbHandle, ()>(
-            TestRole::Admin,
-            None,
-        ).await.expect("login should succeed");
+        let (status, headers, body) =
+            login::<FakeConfig, TestRole, TestDbHandle, ()>(TestRole::Admin, None)
+                .await
+                .expect("login should succeed");
 
         // Status is 200 OK.
         assert_eq!(status, StatusCode::OK);
 
         // Set-Cookie header is present and starts with the correct cookie name.
-        let cookie = headers.get(header::SET_COOKIE)
+        let cookie = headers
+            .get(header::SET_COOKIE)
             .expect("Set-Cookie header should be present")
             .to_str()
             .expect("cookie should be valid UTF-8");
@@ -297,7 +299,8 @@ mod tests {
 
         // Exactly one session exists in the database.
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get sessions");
+            .await
+            .expect("failed to get sessions");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].role, TestRole::Admin);
         assert!(all[0].meta.is_none());
@@ -308,14 +311,15 @@ mod tests {
     async fn test_login_creates_session_with_meta() {
         let meta = serde_json::json!({"user_id": 42, "department": "engineering"});
 
-        let (_status, _headers, body) = login::<FakeConfig, TestRole, TestDbHandle, _>(
-            TestRole::Customer,
-            Some(meta.clone()),
-        ).await.expect("login should succeed");
+        let (_status, _headers, body) =
+            login::<FakeConfig, TestRole, TestDbHandle, _>(TestRole::Customer, Some(meta.clone()))
+                .await
+                .expect("login should succeed");
 
         // Session in the database has the correct role and metadata.
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get sessions");
+            .await
+            .expect("failed to get sessions");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].role, TestRole::Customer);
         assert_eq!(all[0].meta, Some(meta));
@@ -328,15 +332,15 @@ mod tests {
     /// HeaderToken with the correct unique_id.
     #[saps::db_test]
     async fn test_login_token_is_decodable() {
-        let (_status, _headers, body) = login::<FakeConfig, TestRole, TestDbHandle, ()>(
-            TestRole::Admin,
-            None,
-        ).await.expect("login should succeed");
+        let (_status, _headers, body) =
+            login::<FakeConfig, TestRole, TestDbHandle, ()>(TestRole::Admin, None)
+                .await
+                .expect("login should succeed");
 
         // Decode the JWT and verify the unique_id matches.
-        let decoded = HeaderToken::<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>::decode(&body.0.token)
-
-            .expect("token should decode successfully");
+        let decoded =
+            HeaderToken::<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>::decode(&body.0.token)
+                .expect("token should decode successfully");
         assert_eq!(decoded.unique_id, body.0.unique_id);
     }
 
@@ -344,13 +348,14 @@ mod tests {
     /// embedded in the JWT, ensuring the token and session are correctly linked.
     #[saps::db_test]
     async fn test_login_session_id_matches_token_id() {
-        let (_status, _headers, body) = login::<FakeConfig, TestRole, TestDbHandle, ()>(
-            TestRole::Customer,
-            None,
-        ).await.expect("login should succeed");
+        let (_status, _headers, body) =
+            login::<FakeConfig, TestRole, TestDbHandle, ()>(TestRole::Customer, None)
+                .await
+                .expect("login should succeed");
 
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get sessions");
+            .await
+            .expect("failed to get sessions");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id.to_string(), body.0.unique_id);
     }
@@ -358,19 +363,19 @@ mod tests {
     /// Verifies that calling login twice creates two independent sessions.
     #[saps::db_test]
     async fn test_multiple_logins_create_separate_sessions() {
-        let (_, _, body1) = login::<FakeConfig, TestRole, TestDbHandle, ()>(
-            TestRole::Admin,
-            None,
-        ).await.expect("first login should succeed");
+        let (_, _, body1) = login::<FakeConfig, TestRole, TestDbHandle, ()>(TestRole::Admin, None)
+            .await
+            .expect("first login should succeed");
 
-        let (_, _, body2) = login::<FakeConfig, TestRole, TestDbHandle, ()>(
-            TestRole::Customer,
-            None,
-        ).await.expect("second login should succeed");
+        let (_, _, body2) =
+            login::<FakeConfig, TestRole, TestDbHandle, ()>(TestRole::Customer, None)
+                .await
+                .expect("second login should succeed");
 
         // Two distinct sessions exist.
         let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
-            .await.expect("failed to get sessions");
+            .await
+            .expect("failed to get sessions");
         assert_eq!(all.len(), 2);
 
         // The two sessions have different UUIDs.
@@ -381,10 +386,7 @@ mod tests {
     /// the TOKEN_EXPIRE_MINS variable.
     #[saps::db_test]
     async fn test_login_fails_with_missing_config() {
-        let result = login::<BrokenConfig, TestRole, TestDbHandle, ()>(
-            TestRole::Admin,
-            None,
-        ).await;
+        let result = login::<BrokenConfig, TestRole, TestDbHandle, ()>(TestRole::Admin, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

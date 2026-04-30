@@ -1,22 +1,20 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::quote;
 use syn::{Ident, ItemFn, parse_macro_input};
-use proc_macro2::Span;
 
-mod package_inputs;
 mod extract_inputs;
-
+mod package_inputs;
 
 #[proc_macro_attribute]
 pub fn background_task(_attr: TokenStream, item: TokenStream) -> TokenStream {
-
     // Parse the input function
     let input_fn = parse_macro_input!(item as ItemFn);
     let input_name = input_fn.sig.ident.clone();
     let input_inputs = input_fn.sig.inputs.clone();
-    
+
     let name = input_fn.sig.ident.clone().to_string();
 
     // core function that fires the actual functionality

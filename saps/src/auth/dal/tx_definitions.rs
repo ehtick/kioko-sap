@@ -1,6 +1,6 @@
-use crate::define_dal_transactions;
-use crate::auth::token::checks::UserRole;
 use super::model::AuthSession;
+use crate::auth::token::checks::UserRole;
+use crate::define_dal_transactions;
 use serde_json::Value;
 
 define_dal_transactions!(

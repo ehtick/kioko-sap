@@ -97,7 +97,6 @@
 use crate::errors::saps::SapsError;
 use std::env;
 
-
 /// A trait for retrieving configuration values by name.
 ///
 /// This trait abstracts over the source of configuration — environment variables,
@@ -124,7 +123,6 @@ pub trait GetConfigVariable {
     /// The value as a `String`, or a [`SapsError`] if the key is not found or retrieval fails.
     fn get_config_variable(variable: String) -> Result<String, SapsError>;
 }
-
 
 /// A configuration provider that reads directly from environment variables.
 ///
@@ -158,13 +156,13 @@ impl GetConfigVariable for EnvConfig {
     fn get_config_variable(variable: String) -> Result<String, SapsError> {
         match env::var(&variable) {
             Ok(val) => Ok(val),
-            Err(_) => {
-                Err(SapsError::unknown(format!("{} not found in environment", variable)))
-            },
+            Err(_) => Err(SapsError::unknown(format!(
+                "{} not found in environment",
+                variable
+            ))),
         }
     }
 }
-
 
 /// Generates a config struct backed by hardcoded key/value pairs.
 ///
@@ -346,7 +344,12 @@ mod tests {
     fn test_get_unknown_key_returns_error() {
         let result = TestConfig::get_config_variable("NONEXISTENT_KEY".into());
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("was not found in TestConfig"));
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("was not found in TestConfig")
+        );
     }
 
     define_env_config!(UninitConfig, "UNINIT_VAR_XYZ");
@@ -365,6 +368,11 @@ mod tests {
     fn test_init_fails_when_env_var_missing() {
         let result = MissingEnvConfig::init();
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("not found in environment"));
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("not found in environment")
+        );
     }
 }

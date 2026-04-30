@@ -1,6 +1,5 @@
-use crate::define_dal_transactions;
 use super::model::ScheduledTask;
-
+use crate::define_dal_transactions;
 
 define_dal_transactions!(
     InsertScheduledTask => insert_scheduled_task(task: ScheduledTask) -> bool,

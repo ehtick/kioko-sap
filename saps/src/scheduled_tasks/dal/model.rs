@@ -1,14 +1,13 @@
 use std::str::FromStr;
 
+use chrono::NaiveDateTime;
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
 use uuid::Uuid;
-use chrono::NaiveDateTime;
 
 use crate::dal::connections::{ScheduledTaskPostGresDescriptor, YieldPostGresPool};
 use crate::errors::saps::SapsError;
 use crate::scheduled_tasks::dal::tx_definitions::InsertScheduledTask;
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskStatus {
@@ -42,11 +41,13 @@ impl TryFrom<String> for TaskStatus {
             "in_progress" => Ok(TaskStatus::InProgress),
             "completed" => Ok(TaskStatus::Completed),
             "exited" => Ok(TaskStatus::Exited),
-            _ => Err(SapsError::bad_request(format!("Unknown task status: {}", value))),
+            _ => Err(SapsError::bad_request(format!(
+                "Unknown task status: {}",
+                value
+            ))),
         }
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScheduledTask {
@@ -57,21 +58,37 @@ pub struct ScheduledTask {
     pub time_scheduled: Option<NaiveDateTime>,
     pub time_completed: Option<NaiveDateTime>,
     pub cron_string: String,
-    pub locked: bool
+    pub locked: bool,
 }
 
 impl ScheduledTask {
     /// Constructs a `ScheduledTask` from a Postgres row.
     pub fn from_row(row: &PgRow) -> Result<Self, SapsError> {
         Ok(Self {
-            id: row.try_get("id").map_err(|e| SapsError::unknown(e.to_string()))?,
-            function_name: row.try_get("function_name").map_err(|e| SapsError::unknown(e.to_string()))?,
-            params: row.try_get("params").map_err(|e| SapsError::unknown(e.to_string()))?,
-            task_id: row.try_get("task_id").map_err(|e| SapsError::unknown(e.to_string()))?,
-            time_scheduled: row.try_get("time_scheduled").map_err(|e| SapsError::unknown(e.to_string()))?,
-            time_completed: row.try_get("time_completed").map_err(|e| SapsError::unknown(e.to_string()))?,
-            cron_string: row.try_get("cron_string").map_err(|e| SapsError::unknown(e.to_string()))?,
-            locked: row.try_get("locked").map_err(|e| SapsError::unknown(e.to_string()))?,
+            id: row
+                .try_get("id")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            function_name: row
+                .try_get("function_name")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            params: row
+                .try_get("params")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            task_id: row
+                .try_get("task_id")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            time_scheduled: row
+                .try_get("time_scheduled")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            time_completed: row
+                .try_get("time_completed")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            cron_string: row
+                .try_get("cron_string")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
+            locked: row
+                .try_get("locked")
+                .map_err(|e| SapsError::unknown(e.to_string()))?,
         })
     }
 
@@ -153,12 +170,15 @@ $$;
         cron_string: impl Into<String>,
     ) -> Result<Self, SapsError> {
         let cron_string = cron_string.into();
-        let schedule = cron::Schedule::from_str(&cron_string)
-            .map_err(|e| SapsError::bad_request(format!("invalid cron '{}': {}", cron_string, e)))?;
+        let schedule = cron::Schedule::from_str(&cron_string).map_err(|e| {
+            SapsError::bad_request(format!("invalid cron '{}': {}", cron_string, e))
+        })?;
         let next = schedule
             .upcoming(chrono::Utc)
             .next()
-            .ok_or_else(|| SapsError::bad_request(format!("cron '{}' has no upcoming firing", cron_string)))?
+            .ok_or_else(|| {
+                SapsError::bad_request(format!("cron '{}' has no upcoming firing", cron_string))
+            })?
             .naive_utc();
 
         Ok(Self {
@@ -173,7 +193,6 @@ $$;
         })
     }
 }
-
 
 /// Registers a scheduled task by constructing a [`ScheduledTask`] via
 /// [`ScheduledTask::new`] and inserting it into `saps.scheduled_tasks`.
@@ -198,7 +217,6 @@ pub async fn register_scheduled_task<Y: YieldPostGresPool>(
         .map_err(|e| SapsError::unknown(e.to_string()))
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewScheduledTask {
     pub function_name: String,
@@ -207,5 +225,5 @@ pub struct NewScheduledTask {
     pub time_scheduled: Option<NaiveDateTime>,
     pub time_completed: Option<NaiveDateTime>,
     pub cron_string: String,
-    pub locked: bool
+    pub locked: bool,
 }

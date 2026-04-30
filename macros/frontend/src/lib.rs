@@ -24,17 +24,20 @@ pub fn mount_frontend(input: TokenStream) -> TokenStream {
 
     // Resolve the path relative to the calling crate's CARGO_MANIFEST_DIR so
     // that RustEmbed's #[folder] gets an absolute path that exists at compile time.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not set");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let resolved = std::path::Path::new(&manifest_dir)
         .join(path.value())
         .canonicalize()
-        .unwrap_or_else(|e| panic!(
-            "mount_frontend!: path '{}' resolved to '{}' which does not exist: {}",
-            path.value(),
-            std::path::Path::new(&manifest_dir).join(path.value()).display(),
-            e,
-        ));
+        .unwrap_or_else(|e| {
+            panic!(
+                "mount_frontend!: path '{}' resolved to '{}' which does not exist: {}",
+                path.value(),
+                std::path::Path::new(&manifest_dir)
+                    .join(path.value())
+                    .display(),
+                e,
+            )
+        });
     let resolved_str = resolved.to_string_lossy().to_string();
     let resolved_lit = LitStr::new(&resolved_str, path.span());
 

@@ -1,5 +1,5 @@
-use crate::define_dal_transactions;
 use super::model::QueuedTask;
+use crate::define_dal_transactions;
 use uuid::Uuid;
 
 define_dal_transactions!(

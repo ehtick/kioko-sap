@@ -52,12 +52,9 @@ use super::{
     },
 };
 use crate::{
-    auth::token::checks::UserRole,
-    dal::connections::AuthPostGresDescriptor,
-    db_transaction,
+    auth::token::checks::UserRole, dal::connections::AuthPostGresDescriptor, db_transaction,
 };
 use serde_json::Value;
-
 
 /// Inserts a new auth session into `saps.auth_sessions`.
 ///
@@ -81,13 +78,13 @@ async fn create_auth_session<U: UserRole>(session: AuthSession<U>) -> AuthSessio
         RETURNING id, role, date_created, last_interacted, meta
         "#,
     )
-        .bind(session.id)
-        .bind(session.role.to_string())
-        .bind(session.date_created)
-        .bind(session.last_interacted)
-        .bind(session.meta)
-        .fetch_one(pool)
-        .await?;
+    .bind(session.id)
+    .bind(session.role.to_string())
+    .bind(session.date_created)
+    .bind(session.last_interacted)
+    .bind(session.meta)
+    .fetch_one(pool)
+    .await?;
     AuthSession::from_row(&row).map_err(|e| sqlx::Error::Protocol(e.message))
 }
 
@@ -115,7 +112,8 @@ async fn create_auth_session<U: UserRole>(session: AuthSession<U>) -> AuthSessio
 #[db_transaction(AuthPostGresDescriptor, PingAuthSession)]
 async fn ping_auth_session<U: UserRole>(minutes: i32, session_id: &str) -> Option<AuthSession<U>> {
     let pool = T::yield_pool();
-    let parsed_id: uuid::Uuid = session_id.parse()
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
         .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
     let row = sqlx::query("SELECT * FROM saps.ping($1, $2)")
         .bind(minutes)
@@ -132,8 +130,8 @@ async fn ping_auth_session<U: UserRole>(minutes: i32, session_id: &str) -> Optio
             if id.is_none() {
                 return Ok(None);
             }
-            let session = AuthSession::from_row(&r)
-                .map_err(|e| sqlx::Error::Protocol(e.message))?;
+            let session =
+                AuthSession::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
             Ok(Some(session))
         }
         None => Ok(None),
@@ -152,14 +150,13 @@ async fn ping_auth_session<U: UserRole>(minutes: i32, session_id: &str) -> Optio
 #[db_transaction(AuthPostGresDescriptor, GetAllAuthSessions)]
 async fn get_all_auth_sessions<U: UserRole>() -> Vec<AuthSession<U>> {
     let pool = T::yield_pool();
-    let rows = sqlx::query("SELECT id, role, date_created, last_interacted, meta FROM saps.auth_sessions")
-        .fetch_all(pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT id, role, date_created, last_interacted, meta FROM saps.auth_sessions")
+            .fetch_all(pool)
+            .await?;
     let mut sessions = Vec::with_capacity(rows.len());
     for row in &rows {
-        sessions.push(
-            AuthSession::from_row(row).map_err(|e| sqlx::Error::Protocol(e.message))?
-        );
+        sessions.push(AuthSession::from_row(row).map_err(|e| sqlx::Error::Protocol(e.message))?);
     }
     Ok(sessions)
 }
@@ -183,7 +180,8 @@ async fn get_all_auth_sessions<U: UserRole>() -> Vec<AuthSession<U>> {
 #[db_transaction(AuthPostGresDescriptor, GetAuthSession)]
 async fn get_auth_session<U: UserRole>(session_id: &str) -> Option<AuthSession<U>> {
     let pool = T::yield_pool();
-    let parsed_id: uuid::Uuid = session_id.parse()
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
         .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
     let row = sqlx::query(
         "SELECT id, role, date_created, last_interacted, meta FROM saps.auth_sessions WHERE id = $1"
@@ -193,8 +191,8 @@ async fn get_auth_session<U: UserRole>(session_id: &str) -> Option<AuthSession<U
         .await?;
     match row {
         Some(r) => {
-            let session = AuthSession::from_row(&r)
-                .map_err(|e| sqlx::Error::Protocol(e.message))?;
+            let session =
+                AuthSession::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
             Ok(Some(session))
         }
         None => Ok(None),
@@ -220,7 +218,8 @@ async fn get_auth_session<U: UserRole>(session_id: &str) -> Option<AuthSession<U
 #[db_transaction(AuthPostGresDescriptor, UpdateAuthSessionMeta)]
 async fn update_auth_session_meta(session_id: &str, meta: Value) -> () {
     let pool = T::yield_pool();
-    let parsed_id: uuid::Uuid = session_id.parse()
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
         .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
     sqlx::query("UPDATE saps.auth_sessions SET meta = $1 WHERE id = $2")
         .bind(meta)

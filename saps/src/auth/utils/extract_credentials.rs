@@ -11,9 +11,9 @@
 //! # Notes
 //! - Assumes the Authorization header is in the format: "Basic <base64(email:password)>".
 //! - Returns `SapsError::Unauthorized` for invalid or missing credentials.
+use crate::errors::saps::SapsError;
 use axum::http::{Request, header};
 use base64::{Engine, engine::general_purpose};
-use crate::errors::saps::SapsError;
 
 /// Represents extracted Basic-Auth credentials.
 ///
@@ -78,8 +78,11 @@ pub fn extract_credentials<B>(req: &Request<B>) -> Result<Credentials, SapsError
             if email.is_empty() || password.is_empty() {
                 return Err(SapsError::unauthorized("Invalid credentials".to_string()));
             }
-            Ok(Credentials { email: email.to_owned(), password: password.to_owned() })
-        },
+            Ok(Credentials {
+                email: email.to_owned(),
+                password: password.to_owned(),
+            })
+        }
         _ => Err(SapsError::unauthorized("Invalid credentials".to_string())),
     }
 }
@@ -88,11 +91,15 @@ pub fn extract_credentials<B>(req: &Request<B>) -> Result<Credentials, SapsError
 mod tests {
 
     use super::*;
-    use axum::http::{Request, header};
     use crate::errors::saps::SapsErrorStatus;
+    use axum::http::{Request, header};
 
     fn build_request_with_auth(auth_value: &str) -> Request<()> {
-        Request::builder().uri("/").header(header::AUTHORIZATION, auth_value).body(()).unwrap()
+        Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, auth_value)
+            .body(())
+            .unwrap()
     }
 
     #[test]
