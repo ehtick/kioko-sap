@@ -1,5 +1,6 @@
+use crate::auth::dal::tx_definitions::CompareAndSwapAuthSessionMeta;
 use crate::auth::token::checks::UserRole;
-use crate::dal::connections::YieldPostGresPool;
+use crate::dal::connections::{AuthPostGresDescriptor, YieldPostGresPool};
 use crate::errors::saps::SapsError;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -163,6 +164,36 @@ impl<U: UserRole> AuthSession<U> {
         serde_json::from_value(value).map_err(|e| {
             SapsError::bad_request(format!("failed to deserialize meta key {}: {}", key, e))
         })
+    }
+
+    /// Atomic compare-and-swap on a single top-level key in `meta` for this
+    /// session, against the pool exposed by `Y`.
+    ///
+    /// Convenience wrapper around
+    /// [`AuthPostGresDescriptor::<Y>::compare_and_swap_auth_session_meta`]
+    /// using `self.id` as the session id.
+    ///
+    /// Returns `Some(updated_session)` if the swap happened, or `None` if
+    /// the session no longer exists, the key is absent, or its value does
+    /// not equal `expected`. See the trait docs for the exact match
+    /// semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `sqlx::Error` if the underlying query fails.
+    pub async fn compare_and_swap_meta<Y: YieldPostGresPool>(
+        &self,
+        key: &str,
+        expected: serde_json::Value,
+        new_value: serde_json::Value,
+    ) -> Result<Option<AuthSession<U>>, sqlx::Error> {
+        AuthPostGresDescriptor::<Y>::compare_and_swap_auth_session_meta::<U>(
+            &self.id.to_string(),
+            key,
+            expected,
+            new_value,
+        )
+        .await
     }
 
     /// Returns a SQL script that creates the `saps` schema (if it doesn't exist)

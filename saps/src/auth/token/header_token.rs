@@ -73,8 +73,9 @@ use crate::{
         dal::{
             model::AuthSession,
             tx_definitions::{
-                DeleteAuthSession, DeleteAuthSessionMetaKey, PingAuthSession,
-                UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+                CompareAndSwapAuthSessionMeta, DeleteAuthSession, DeleteAuthSessionMetaKey,
+                GetAuthSessionStrict, PingAuthSession, UpdateAuthSessionMeta,
+                UpsertAuthSessionMetaKey,
             },
         },
         middleware::CookieSlot,
@@ -368,77 +369,175 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
         Ok(())
     }
 
-    /// Forwards to [`AuthSession::meta_get`].
+    /// Atomic compare-and-swap on a single top-level `meta` key for this
+    /// token's auth session.
+    ///
+    /// Wraps
+    /// [`AuthPostGresDescriptor::<Z>::compare_and_swap_auth_session_meta`].
+    /// The swap goes through only if `meta[key]` currently equals
+    /// `expected`; on success the cached
+    /// [`auth_session`](Self::auth_session) is updated to the post-swap row
+    /// and this method returns `Ok(true)`. If the session is gone, the key
+    /// is absent, or the current value differs, the cache is left
+    /// untouched and this method returns `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the database query fails.
+    pub async fn compare_and_swap_auth_session_meta(
+        &mut self,
+        key: &str,
+        expected: serde_json::Value,
+        new_value: serde_json::Value,
+    ) -> Result<bool, SapsError> {
+        let updated = AuthPostGresDescriptor::<Z>::compare_and_swap_auth_session_meta::<R>(
+            &self.unique_id,
+            key,
+            expected,
+            new_value,
+        )
+        .await?;
+        let swapped = updated.is_some();
+        if let Some(session) = updated {
+            self.auth_session = Some(session);
+        }
+        Ok(swapped)
+    }
+
+    /// Re-fetches the auth session from the database and stores it on the
+    /// token, replacing any stale cached value.
+    ///
+    /// Use this before reading `meta` if another task may have written to the
+    /// session since the extractor ran. The non-`_local` getters
+    /// (e.g. [`meta_get`](Self::meta_get)) call this for you; the `_local`
+    /// getters do not, and read whatever cached value is already on the
+    /// token.
+    ///
+    /// Backed by [`GetAuthSessionStrict`], so a missing row surfaces as
+    /// `sqlx::Error::RowNotFound` (wrapped in [`SapsError`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if:
+    /// - The session no longer exists in the database.
+    /// - The query fails or the role cannot be parsed back into `R`.
+    pub async fn refresh_auth_session(&mut self) -> Result<&AuthSession<R>, SapsError> {
+        let session = AuthPostGresDescriptor::<Z>::get_auth_session_strict::<R>(&self.unique_id)
+            .await?;
+        self.auth_session = Some(session);
+        self.get_auth_session()
+    }
+
+    /// Reads `meta[key]` from the **cached** auth session attached to this
+    /// token. Forwards to [`AuthSession::meta_get`].
+    ///
+    /// **Warning:** this does not hit the database. If another task may have
+    /// updated the session's `meta` since the extractor ran, the cached
+    /// value here may be stale. Use [`meta_get`](Self::meta_get) for a fresh
+    /// read.
     ///
     /// # Errors
     ///
     /// Returns [`SapsError::bad_request`] if the auth session has not been
     /// loaded onto this token (i.e. the extractor hasn't run).
-    pub fn meta_get(&self, key: &str) -> Result<Option<&serde_json::Value>, SapsError> {
+    pub fn meta_get_local(&self, key: &str) -> Result<Option<&serde_json::Value>, SapsError> {
         Ok(self.get_auth_session()?.meta_get(key))
     }
 
-    /// Forwards to [`AuthSession::meta_get_owned`].
+    /// Reads `meta[key]` from the **cached** auth session, returning an owned
+    /// clone. Forwards to [`AuthSession::meta_get_owned`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use [`meta_get_owned`](Self::meta_get_owned) for a fresh read.
     ///
     /// # Errors
     ///
     /// Returns [`SapsError::bad_request`] if the auth session has not been
     /// loaded onto this token.
-    pub fn meta_get_owned(&self, key: &str) -> Result<Option<serde_json::Value>, SapsError> {
+    pub fn meta_get_owned_local(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, SapsError> {
         Ok(self.get_auth_session()?.meta_get_owned(key))
     }
 
-    /// Forwards to [`AuthSession::meta_get_strict`].
+    /// Reads `meta[key]` from the **cached** auth session. Forwards to
+    /// [`AuthSession::meta_get_strict`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use [`meta_get_strict`](Self::meta_get_strict) for a fresh read.
     ///
     /// # Errors
     ///
     /// Returns [`SapsError::bad_request`] if the auth session has not been
     /// loaded onto this token, or [`SapsError::not_found`] if `key` is not
     /// present in `meta`.
-    pub fn meta_get_strict(&self, key: &str) -> Result<&serde_json::Value, SapsError> {
+    pub fn meta_get_strict_local(&self, key: &str) -> Result<&serde_json::Value, SapsError> {
         self.get_auth_session()?.meta_get_strict(key)
     }
 
-    /// Forwards to [`AuthSession::meta_get_strict_owned`].
+    /// Reads `meta[key]` from the **cached** auth session, returning an owned
+    /// clone. Forwards to [`AuthSession::meta_get_strict_owned`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use [`meta_get_strict_owned`](Self::meta_get_strict_owned) for
+    /// a fresh read.
     ///
     /// # Errors
     ///
     /// Returns [`SapsError::bad_request`] if the auth session has not been
     /// loaded onto this token, or [`SapsError::not_found`] if `key` is not
     /// present in `meta`.
-    pub fn meta_get_strict_owned(&self, key: &str) -> Result<serde_json::Value, SapsError> {
+    pub fn meta_get_strict_owned_local(
+        &self,
+        key: &str,
+    ) -> Result<serde_json::Value, SapsError> {
         self.get_auth_session()?.meta_get_strict_owned(key)
     }
 
-    /// Forwards to [`AuthSession::meta_get_typed`].
+    /// Reads `meta[key]` from the **cached** auth session and deserializes
+    /// it as `T`. Forwards to [`AuthSession::meta_get_typed`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use [`meta_get_typed`](Self::meta_get_typed) for a fresh read.
     ///
     /// # Errors
     ///
     /// Returns [`SapsError::bad_request`] if the auth session has not been
     /// loaded onto this token, or if the value at `key` cannot be decoded
     /// as `T`.
-    pub fn meta_get_typed<'a, T>(&'a self, key: &str) -> Result<Option<T>, SapsError>
+    pub fn meta_get_typed_local<'a, T>(&'a self, key: &str) -> Result<Option<T>, SapsError>
     where
         T: Deserialize<'a>,
     {
         self.get_auth_session()?.meta_get_typed(key)
     }
 
-    /// Forwards to [`AuthSession::meta_get_typed_owned`].
+    /// Reads `meta[key]` from the **cached** auth session and deserializes
+    /// it as `T`. Forwards to [`AuthSession::meta_get_typed_owned`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use [`meta_get_typed_owned`](Self::meta_get_typed_owned) for a
+    /// fresh read.
     ///
     /// # Errors
     ///
     /// Returns [`SapsError::bad_request`] if the auth session has not been
     /// loaded onto this token, or if the value at `key` cannot be decoded
     /// as `T`.
-    pub fn meta_get_typed_owned<T: DeserializeOwned>(
+    pub fn meta_get_typed_owned_local<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<Option<T>, SapsError> {
         self.get_auth_session()?.meta_get_typed_owned(key)
     }
 
-    /// Forwards to [`AuthSession::meta_get_typed_strict`].
+    /// Reads `meta[key]` from the **cached** auth session and deserializes
+    /// it as `T`. Forwards to [`AuthSession::meta_get_typed_strict`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use [`meta_get_typed_strict`](Self::meta_get_typed_strict) for
+    /// a fresh read.
     ///
     /// # Errors
     ///
@@ -446,14 +545,20 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// loaded onto this token, [`SapsError::not_found`] if `key` is not
     /// present in `meta`, or [`SapsError::bad_request`] if the value cannot
     /// be decoded as `T`.
-    pub fn meta_get_typed_strict<'a, T>(&'a self, key: &str) -> Result<T, SapsError>
+    pub fn meta_get_typed_strict_local<'a, T>(&'a self, key: &str) -> Result<T, SapsError>
     where
         T: Deserialize<'a>,
     {
         self.get_auth_session()?.meta_get_typed_strict(key)
     }
 
-    /// Forwards to [`AuthSession::meta_get_typed_strict_owned`].
+    /// Reads `meta[key]` from the **cached** auth session and deserializes
+    /// it as `T`. Forwards to [`AuthSession::meta_get_typed_strict_owned`].
+    ///
+    /// **Warning:** this does not hit the database. The cached value may be
+    /// stale. Use
+    /// [`meta_get_typed_strict_owned`](Self::meta_get_typed_strict_owned) for
+    /// a fresh read.
     ///
     /// # Errors
     ///
@@ -461,11 +566,141 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// loaded onto this token, [`SapsError::not_found`] if `key` is not
     /// present in `meta`, or [`SapsError::bad_request`] if the value cannot
     /// be decoded as `T`.
-    pub fn meta_get_typed_strict_owned<T: DeserializeOwned>(
+    pub fn meta_get_typed_strict_owned_local<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<T, SapsError> {
         self.get_auth_session()?.meta_get_typed_strict_owned(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`.
+    ///
+    /// Calls [`refresh_auth_session`](Self::refresh_auth_session) before
+    /// delegating to [`meta_get_local`](Self::meta_get_local), so the value
+    /// reflects the row currently in the database (immune to concurrent
+    /// writes from other tasks since the extractor ran).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails (see
+    /// [`refresh_auth_session`](Self::refresh_auth_session)).
+    pub async fn meta_get<'a>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<Option<&'a serde_json::Value>, SapsError> {
+        self.refresh_auth_session().await?;
+        self.meta_get_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`,
+    /// returning an owned clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails.
+    pub async fn meta_get_owned(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, SapsError> {
+        self.refresh_auth_session().await?;
+        self.meta_get_owned_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, or
+    /// [`SapsError::not_found`] if `key` is not present in `meta`.
+    pub async fn meta_get_strict<'a>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<&'a serde_json::Value, SapsError> {
+        self.refresh_auth_session().await?;
+        self.meta_get_strict_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`,
+    /// returning an owned clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, or
+    /// [`SapsError::not_found`] if `key` is not present in `meta`.
+    pub async fn meta_get_strict_owned(
+        &mut self,
+        key: &str,
+    ) -> Result<serde_json::Value, SapsError> {
+        self.refresh_auth_session().await?;
+        self.meta_get_strict_owned_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`
+    /// deserialized as `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, or if the value at `key`
+    /// cannot be decoded as `T`.
+    pub async fn meta_get_typed<'a, T>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<Option<T>, SapsError>
+    where
+        T: Deserialize<'a>,
+    {
+        self.refresh_auth_session().await?;
+        self.meta_get_typed_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`
+    /// deserialized as `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, or if the value at `key`
+    /// cannot be decoded as `T`.
+    pub async fn meta_get_typed_owned<T: DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<T>, SapsError> {
+        self.refresh_auth_session().await?;
+        self.meta_get_typed_owned_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`
+    /// deserialized as `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, [`SapsError::not_found`]
+    /// if `key` is not present, or a decode error if the value cannot be
+    /// parsed as `T`.
+    pub async fn meta_get_typed_strict<'a, T>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<T, SapsError>
+    where
+        T: Deserialize<'a>,
+    {
+        self.refresh_auth_session().await?;
+        self.meta_get_typed_strict_local(key)
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`
+    /// deserialized as `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, [`SapsError::not_found`]
+    /// if `key` is not present, or a decode error if the value cannot be
+    /// parsed as `T`.
+    pub async fn meta_get_typed_strict_owned<T: DeserializeOwned>(
+        &mut self,
+        key: &str,
+    ) -> Result<T, SapsError> {
+        self.refresh_auth_session().await?;
+        self.meta_get_typed_strict_owned_local(key)
     }
 
     /// Encodes this token into a signed HS256 JWT string.

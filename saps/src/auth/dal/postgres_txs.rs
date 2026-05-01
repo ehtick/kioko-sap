@@ -47,10 +47,10 @@
 use super::{
     model::AuthSession,
     tx_definitions::{
-        CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
-        DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
-        GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict, GetAuthSessionsByMetaKey,
-        PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+        CompareAndSwapAuthSessionMeta, CreateAuthSession, DeleteAuthSession,
+        DeleteAuthSessionMetaKey, DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession,
+        GetAuthSessionByMetaKey, GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict,
+        GetAuthSessionsByMetaKey, PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
         UpsertAuthSessionsMetaKeyByMeta,
     },
 };
@@ -303,6 +303,70 @@ async fn upsert_auth_session_meta_key<U: UserRole>(
         .bind(key)
         .bind(value)
         .bind(parsed_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let session =
+                AuthSession::from_row(&r).map_err(|e| sqlx::Error::Protocol(e.message))?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Atomic compare-and-swap on a single top-level key in `meta`.
+///
+/// Updates `meta[key]` to `new_value` only if the current value at `key`
+/// equals `expected`. The check and the write happen in a single
+/// `UPDATE ... WHERE` so concurrent writers can't slip in between the read
+/// and the write.
+///
+/// Returns `Some(AuthSession<U>)` with the post-update row when the swap
+/// succeeded, or `None` when:
+/// - The session does not exist,
+/// - The key is absent from `meta` (or `meta` is `NULL`),
+/// - The current value at `key` does not equal `expected`.
+///
+/// JSONB equality semantics apply: an explicit JSON `null` at `key` matches
+/// an `expected` of `Value::Null`, but a missing key never matches anything
+/// (because `meta -> 'missing'` is SQL `NULL` and `NULL = anything` is
+/// unknown, so the row is filtered out).
+///
+/// # Arguments
+///
+/// * `session_id` - The UUID of the session to update, as a string.
+/// * `key` - The top-level key in `meta` to compare and swap.
+/// * `expected` - The JSON value that `meta[key]` must currently equal.
+/// * `new_value` - The JSON value to write if the comparison matches.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The `session_id` is not a valid UUID
+/// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, CompareAndSwapAuthSessionMeta)]
+async fn compare_and_swap_auth_session_meta<U: UserRole>(
+    session_id: &str,
+    key: &str,
+    expected: Value,
+    new_value: Value,
+) -> Option<AuthSession<U>> {
+    let pool = T::yield_pool();
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
+    let row = sqlx::query(
+        "UPDATE saps.auth_sessions \
+         SET meta = jsonb_set(meta, ARRAY[$2], $4, true) \
+         WHERE id = $1 AND meta -> $2 = $3 \
+         RETURNING id, role, date_created, last_interacted, meta",
+    )
+        .bind(parsed_id)
+        .bind(key)
+        .bind(expected)
+        .bind(new_value)
         .fetch_optional(pool)
         .await?;
     match row {

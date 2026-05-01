@@ -17,5 +17,6 @@ define_dal_transactions!(
     GetAuthSessionByMetaKey => get_auth_session_by_meta_key[U: UserRole](key: &str, value: Value) -> Option<AuthSession<U>>,
     GetAuthSessionByMetaKeyStrict => get_auth_session_by_meta_key_strict[U: UserRole](key: &str, value: Value) -> AuthSession<U>,
     DeleteAuthSessionsByMetaKey => delete_auth_sessions_by_meta_key(key: &str, value: Value) -> u64,
-    UpsertAuthSessionsMetaKeyByMeta => upsert_auth_sessions_meta_key_by_meta(match_key: &str, match_value: Value, upsert_key: &str, upsert_value: Value) -> u64
+    UpsertAuthSessionsMetaKeyByMeta => upsert_auth_sessions_meta_key_by_meta(match_key: &str, match_value: Value, upsert_key: &str, upsert_value: Value) -> u64,
+    CompareAndSwapAuthSessionMeta => compare_and_swap_auth_session_meta[U: UserRole](session_id: &str, key: &str, expected: Value, new_value: Value) -> Option<AuthSession<U>>
 );
