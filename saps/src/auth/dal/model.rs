@@ -2,7 +2,7 @@ use crate::auth::token::checks::UserRole;
 use crate::dal::connections::YieldPostGresPool;
 use crate::errors::saps::SapsError;
 use chrono::NaiveDateTime;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{Executor, Pool, Postgres, Row, postgres::PgRow};
 use uuid::Uuid;
 
@@ -63,6 +63,48 @@ impl<U: UserRole> AuthSession<U> {
     pub fn with_meta<M: Serialize>(mut self, meta: M) -> Self {
         self.meta = Some(serde_json::to_value(meta).expect("failed to serialize meta to JSON"));
         self
+    }
+
+    /// Returns the JSON value at top-level `key` in `meta`, or `None` if
+    /// `meta` is `NULL` or does not contain `key`.
+    pub fn meta_get(&self, key: &str) -> Option<serde_json::Value> {
+        self.meta.as_ref().and_then(|m| m.get(key)).cloned()
+    }
+
+    /// Returns the JSON value at top-level `key` in `meta`, or
+    /// `SapsError::not_found(...)` if `meta` is `NULL` or does not contain `key`.
+    pub fn meta_get_strict(&self, key: &str) -> Result<serde_json::Value, SapsError> {
+        self.meta_get(key)
+            .ok_or_else(|| SapsError::not_found(format!("meta key not found: {}", key)))
+    }
+
+    /// Returns the value at top-level `key` in `meta` deserialized as `T`.
+    ///
+    /// Returns `Ok(None)` if `meta` is `NULL` or does not contain `key`.
+    /// Returns `Err(SapsError::bad_request(...))` if the value is present but
+    /// cannot be decoded as `T`.
+    pub fn meta_get_typed<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, SapsError> {
+        match self.meta_get(key) {
+            Some(value) => serde_json::from_value(value).map(Some).map_err(|e| {
+                SapsError::bad_request(format!(
+                    "failed to deserialize meta key {}: {}",
+                    key, e
+                ))
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the value at top-level `key` in `meta` deserialized as `T`, or
+    /// `SapsError::not_found(...)` if the key is missing.
+    ///
+    /// Returns `Err(SapsError::bad_request(...))` if the value is present but
+    /// cannot be decoded as `T`.
+    pub fn meta_get_typed_strict<T: DeserializeOwned>(&self, key: &str) -> Result<T, SapsError> {
+        let value = self.meta_get_strict(key)?;
+        serde_json::from_value(value).map_err(|e| {
+            SapsError::bad_request(format!("failed to deserialize meta key {}: {}", key, e))
+        })
     }
 
     /// Returns a SQL script that creates the `saps` schema (if it doesn't exist)
@@ -227,6 +269,8 @@ $$;
     }
 }
 
+// MARK: - Tests
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +280,7 @@ mod tests {
         GetAuthSessionsByMetaKey, PingAuthSession, UpsertAuthSessionMetaKey,
         UpsertAuthSessionsMetaKeyByMeta,
     };
+    use crate::errors::saps::SapsErrorStatus;
     use crate::dal::connections::AuthPostGresDescriptor;
 
     #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
@@ -958,5 +1003,103 @@ mod tests {
         .expect("get session")
         .expect("session should exist");
         assert_eq!(unchanged.meta, Some(serde_json::json!({"user_id": 2})));
+    }
+
+    #[test]
+    fn test_meta_get_returns_value_when_key_exists() {
+        let session = AuthSession::new(TestRole::Admin)
+            .with_meta(serde_json::json!({"user_id": 7, "team": "backend"}));
+        assert_eq!(session.meta_get("user_id"), Some(serde_json::json!(7)));
+        assert_eq!(session.meta_get("team"), Some(serde_json::json!("backend")));
+    }
+
+    #[test]
+    fn test_meta_get_returns_none_when_key_missing() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        assert_eq!(session.meta_get("missing"), None);
+    }
+
+    #[test]
+    fn test_meta_get_returns_none_when_meta_is_none() {
+        let session = AuthSession::<TestRole>::new(TestRole::Admin);
+        assert!(session.meta.is_none());
+        assert_eq!(session.meta_get("user_id"), None);
+    }
+
+    #[test]
+    fn test_meta_get_strict_returns_value_when_key_exists() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        let value = session.meta_get_strict("user_id").expect("present");
+        assert_eq!(value, serde_json::json!(7));
+    }
+
+    #[test]
+    fn test_meta_get_strict_not_found_when_key_missing() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        let err = session.meta_get_strict("missing").expect_err("missing");
+        assert_eq!(err.status, SapsErrorStatus::NotFound);
+    }
+
+    #[test]
+    fn test_meta_get_strict_not_found_when_meta_is_none() {
+        let session = AuthSession::<TestRole>::new(TestRole::Admin);
+        let err = session.meta_get_strict("user_id").expect_err("missing");
+        assert_eq!(err.status, SapsErrorStatus::NotFound);
+    }
+
+    #[test]
+    fn test_meta_get_typed_returns_some_typed_value() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        let value: Option<i32> = session.meta_get_typed("user_id").expect("decoded");
+        assert_eq!(value, Some(7));
+    }
+
+    #[test]
+    fn test_meta_get_typed_returns_none_when_key_missing() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        let value: Option<i32> = session.meta_get_typed("missing").expect("ok");
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_meta_get_typed_bad_request_on_type_mismatch() {
+        let session = AuthSession::new(TestRole::Admin)
+            .with_meta(serde_json::json!({"user_id": "not-a-number"}));
+        let result: Result<Option<i32>, _> = session.meta_get_typed("user_id");
+        let err = result.expect_err("should fail to decode");
+        assert_eq!(err.status, SapsErrorStatus::BadRequest);
+    }
+
+    #[test]
+    fn test_meta_get_typed_strict_returns_value() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        let value: i32 = session.meta_get_typed_strict("user_id").expect("decoded");
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn test_meta_get_typed_strict_not_found_when_key_missing() {
+        let session =
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 7}));
+        let err = session
+            .meta_get_typed_strict::<i32>("missing")
+            .expect_err("missing");
+        assert_eq!(err.status, SapsErrorStatus::NotFound);
+    }
+
+    #[test]
+    fn test_meta_get_typed_strict_bad_request_on_type_mismatch() {
+        let session = AuthSession::new(TestRole::Admin)
+            .with_meta(serde_json::json!({"user_id": "not-a-number"}));
+        let err = session
+            .meta_get_typed_strict::<i32>("user_id")
+            .expect_err("bad value");
+        assert_eq!(err.status, SapsErrorStatus::BadRequest);
     }
 }
