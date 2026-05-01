@@ -335,8 +335,8 @@ mod tests {
     use crate::auth::dal::tx_definitions::{
         CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
         DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
-        GetAuthSessionsByMetaKey, PingAuthSession, UpsertAuthSessionMetaKey,
-        UpsertAuthSessionsMetaKeyByMeta,
+        GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict, GetAuthSessionsByMetaKey,
+        PingAuthSession, UpsertAuthSessionMetaKey, UpsertAuthSessionsMetaKeyByMeta,
     };
     use crate::errors::saps::SapsErrorStatus;
     use crate::dal::connections::AuthPostGresDescriptor;
@@ -1227,5 +1227,94 @@ mod tests {
             .meta_get_typed_strict::<i32>("user_id")
             .expect_err("missing");
         assert_eq!(err.status, SapsErrorStatus::NotFound);
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_strict_returns_session() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create");
+
+        let fetched =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_strict::<TestRole>(
+                &created.id.to_string(),
+            )
+            .await
+            .expect("strict get should find session");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.role, TestRole::Admin);
+        assert_eq!(fetched.meta, Some(serde_json::json!({"user_id": 1})));
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_strict_row_not_found() {
+        let fake_id = uuid::Uuid::new_v4().to_string();
+        let err = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_strict::<TestRole>(
+            &fake_id,
+        )
+        .await
+        .expect_err("missing session should error");
+        assert!(
+            matches!(err, sqlx::Error::RowNotFound),
+            "expected RowNotFound, got {:?}",
+            err
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_strict_invalid_uuid_errors() {
+        let err = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_strict::<TestRole>(
+            "not-a-uuid",
+        )
+        .await
+        .expect_err("invalid uuid should error");
+        assert!(
+            matches!(err, sqlx::Error::Protocol(_)),
+            "expected Protocol error, got {:?}",
+            err
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_by_meta_key_strict_returns_session() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 7})),
+        )
+        .await
+        .expect("create");
+
+        let fetched =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_by_meta_key_strict::<TestRole>(
+                "user_id",
+                serde_json::json!(7),
+            )
+            .await
+            .expect("strict get should find session");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.role, TestRole::Customer);
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_session_by_meta_key_strict_row_not_found() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create");
+
+        let err =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_session_by_meta_key_strict::<TestRole>(
+                "user_id",
+                serde_json::json!(99),
+            )
+            .await
+            .expect_err("no matching session should error");
+        assert!(
+            matches!(err, sqlx::Error::RowNotFound),
+            "expected RowNotFound, got {:?}",
+            err
+        );
     }
 }

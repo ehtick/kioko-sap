@@ -49,7 +49,8 @@ use super::{
     tx_definitions::{
         CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
         DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
-        GetAuthSessionsByMetaKey, PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+        GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict, GetAuthSessionsByMetaKey,
+        PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
         UpsertAuthSessionsMetaKeyByMeta,
     },
 };
@@ -199,6 +200,36 @@ async fn get_auth_session<U: UserRole>(session_id: &str) -> Option<AuthSession<U
         }
         None => Ok(None),
     }
+}
+
+/// Strict variant of [`get_auth_session`] that returns
+/// `sqlx::Error::RowNotFound` instead of `Ok(None)` when no session matches.
+///
+/// Useful when the caller has already established that the session must
+/// exist (e.g. its id came from a token that was just validated) and wants
+/// the missing-row case to surface as an error rather than as
+/// `Option::None`.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The `session_id` is not a valid UUID
+/// - No session exists with that id (`sqlx::Error::RowNotFound`)
+/// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, GetAuthSessionStrict)]
+async fn get_auth_session_strict<U: UserRole>(session_id: &str) -> AuthSession<U> {
+    let pool = T::yield_pool();
+    let parsed_id: uuid::Uuid = session_id
+        .parse()
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid session_id UUID: {}", e)))?;
+    let row = sqlx::query(
+        "SELECT id, role, date_created, last_interacted, meta FROM saps.auth_sessions WHERE id = $1"
+    )
+        .bind(parsed_id)
+        .fetch_one(pool)
+        .await?;
+    AuthSession::from_row(&row).map_err(|e| sqlx::Error::Protocol(e.message))
 }
 
 /// Replaces the `meta` JSON for an existing auth session.
@@ -413,6 +444,42 @@ async fn get_auth_session_by_meta_key<U: UserRole>(
         }
         None => Ok(None),
     }
+}
+
+/// Strict variant of [`get_auth_session_by_meta_key`] that returns
+/// `sqlx::Error::RowNotFound` instead of `Ok(None)` when no session contains
+/// the given key/value pair.
+///
+/// Same containment lookup with `LIMIT 1` semantics — pair with the partial
+/// unique index from
+/// [`AuthSession::generate_unique_meta_key_sql`](super::model::AuthSession::generate_unique_meta_key_sql)
+/// to guarantee the result is the unique match. Useful when the caller is
+/// certain the session exists and wants the missing-row case to error
+/// rather than return `None`.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - No session matches the key/value pair (`sqlx::Error::RowNotFound`)
+/// - The query fails
+/// - The returned `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, GetAuthSessionByMetaKeyStrict)]
+async fn get_auth_session_by_meta_key_strict<U: UserRole>(
+    key: &str,
+    value: Value,
+) -> AuthSession<U> {
+    let pool = T::yield_pool();
+    let row = sqlx::query(
+        "SELECT id, role, date_created, last_interacted, meta \
+         FROM saps.auth_sessions \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb) \
+         LIMIT 1",
+    )
+        .bind(key)
+        .bind(value)
+        .fetch_one(pool)
+        .await?;
+    AuthSession::from_row(&row).map_err(|e| sqlx::Error::Protocol(e.message))
 }
 
 /// Sets `upsert_key`/`upsert_value` on every session whose `meta` matches
