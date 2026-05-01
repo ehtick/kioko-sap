@@ -7,8 +7,8 @@ This framework combines `Svelte`, `Axum`, `Postgres`, and `sqlx` with helpful ma
 - [DB Transactions](#db-transactions)
 - [Config Variables](#config-variables)
 - [Auth](#auth)
+- [Embedding and serving a frontend](#embedding-and-serving-a-frontend)
 - [Background Tasks](#background-tasks)
-- [Other things that are being worked on](#other-things-that-are-being-worked-on)
 
 ## DB Transactions
 
@@ -1026,9 +1026,58 @@ mod tests {
 `define_static_config!` is enough for testing because the extractor only needs `TOKEN_EXPIRE_MINS` and `SECRET_KEY`. Use `define_env_config!` (see [Config Variables](#config-variables)) in production.
 
 
+## Embedding and serving a frontend
+
+Saps embeds your frontend build folder into the binary at compile time and mounts it onto your axum router with a single macro call. The folder is walked at compile time via `rust-embed`, so the resulting binary serves the frontend without ever touching the filesystem at runtime — one self-contained executable that hosts both your API and your SPA.
+
+```rust
+use saps::axum::{Router, response::IntoResponse, routing::get};
+use saps::config::EnvConfig;
+use saps::mount_frontend;
+
+async fn ping() -> impl IntoResponse { "pong" }
+
+#[tokio::main]
+async fn main() {
+    // Mount API routes BEFORE mount_frontend! — they win against the SPA fallback.
+    let app = Router::new().route("/api/v1/ping", get(ping));
+    let app = api::networking::users::users_factory::<EnvConfig>(app);
+
+    // Args: (folder relative to your crate's Cargo.toml, the Router binding to
+    // extend in place, max-age in seconds for cached static assets).
+    mount_frontend!("frontend/web/public", app, 604800);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    saps::axum::serve(listener, app).await.unwrap();
+}
+```
+
+> [!IMPORTANT]
+> Prefix every backend endpoint with `/api/`. The macro registers an axum fallback that catches every unmatched `GET` and serves it as either an embedded asset or the SPA shell — without the prefix convention, a typo in an API URL would silently return `index.html` with `200 OK` and `Content-Type: text/html`, and your client would parse HTML where it expected JSON. The fallback hard-rejects `/api/...` with a `404` so the mistake surfaces immediately, but it can only do that if your real API routes follow that prefix.
+
+The third macro argument is a `max-age` in seconds. The caching rules the macro applies are:
+
+- `index.html` is always `Cache-Control: no-cache` (it references hashed asset filenames that change every build, so caching it would freeze users on the previous deploy).
+- Every other asset is `Cache-Control: public, max-age=<cache_seconds>`.
+
+So the `604800` (7 days) above caches the hashed bundle assets aggressively while always fetching fresh `index.html`, meaning deploys take effect for users on their next pageload.
+
+For the full routing decision tree (SPA fallback rules, `.wasm` MIME handling, file-shaped 404s for stale hashed assets), see the [`saps-frontend-macro` crate README](macros/frontend/README.md).
+
+
 ## Background Tasks
 
-The persistence of background tasks is handled in a non-public schema in postgres. With saps, we can shoot off random background tasks to the execution queue and you can also schedule background tasks for individual times or periods. First, we need the following imports:
+The persistence of background tasks is handled in a non-public schema in postgres. With saps, we can shoot off random background tasks to the execution queue and you can also schedule background tasks for individual times or periods.
+
+> [!WARNING]
+> The `#[background_task]` macro registers each task into a global registry **before `main` runs** so the worker pool can look tasks up by name. That registration relies on the [`ctor`](https://crates.io/crates/ctor) crate's pre-main initialization. If you're going to use background tasks, add `ctor` as a direct dependency in your crate's `Cargo.toml` — the macro expansion references it by name, and without the crate present the build will fail with an unresolved-path error.
+>
+> ```toml
+> [dependencies]
+> ctor = "0.10"
+> ```
+
+First, we need the following imports:
 
 ```rust
 use saps_background_task::background_task;
@@ -1143,7 +1192,3 @@ let outcome = add::<LivePostGresPool>(1, 2).await;
 ```
 
 Note that the `::<LivePostGresPool>` was added to the `add` function. This is because we need a handle to access the db pool. Remember, because it has the DB pool handle these background tasks can be involved in `#[db_test]` tests.
-
-
-## Other things that are being worked on
-

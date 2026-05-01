@@ -348,20 +348,13 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95d0d11eb38e7642efca359c3cf6eb7b2e528182d09110165de70192b0352775"
+checksum = "b8f521dd9c9e5f03986eb5c674b14b21e9ccf2eb9f98fecb681100214d5e9e4f"
 dependencies = [
- "ctor-proc-macro",
- "dtor",
  "link-section",
+ "linktime-proc-macro",
 ]
-
-[[package]]
-name = "ctor-proc-macro"
-version = "0.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7ab264ea985f1bd27887d7b21ea2bb046728e05d11909ca138d700c494730db"
 
 [[package]]
 name = "curve25519-dalek"
@@ -435,21 +428,6 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
-name = "dtor"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17f72721db8027a4e96dd6fb50d2a1d32259c9d3da1b63dee612ccd981e14293"
-dependencies = [
- "dtor-proc-macro",
-]
-
-[[package]]
-name = "dtor-proc-macro"
-version = "0.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c98b077c7463d01d22dde8a24378ddf1ca7263dc687cffbed38819ea6c21131"
 
 [[package]]
 name = "ecdsa"
@@ -1132,9 +1110,15 @@ dependencies = [
 
 [[package]]
 name = "link-section"
-version = "0.2.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "468808413fa8bdf0edbe61c2bbc182dfc59885b94f496cf3fb42c9c96b1e0149"
+checksum = "0567ec9fe5ffdf9241cd90a7629f250a5f903d6ff4573cf7903308662d6fce40"
+
+[[package]]
+name = "linktime-proc-macro"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a44cd706ff0d503ee32b2071166510ca27e281228de10cd3aa8d35ff94560f81"
 
 [[package]]
 name = "litemap"
@@ -1722,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "saps"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "axum",
  "base64",
@@ -1738,7 +1722,7 @@ dependencies = [
  "saps-background-task 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-pool-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-tx 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "saps-frontend-macro 0.1.0",
+ "saps-frontend-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-test-macro 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
@@ -1816,9 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "saps-frontend-macro"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ff2b9784ad0615af920579bed795d219f90758007f6dfbc6cc850d730b795b"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1828,6 +1810,8 @@ dependencies = [
 [[package]]
 name = "saps-frontend-macro"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95414281cc3a52470c76b74953b42536857b9eb05eba26d266f19caf77761af6"
 dependencies = [
  "proc-macro2",
  "quote",

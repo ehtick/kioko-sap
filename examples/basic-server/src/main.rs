@@ -18,7 +18,7 @@ async fn main() {
 
     let app = api::networking::users::users_factory::<EnvConfig>(app);
 
-    mount_frontend!("frontend/web/public", app);
+    mount_frontend!("frontend/web/public", app, 1000);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
