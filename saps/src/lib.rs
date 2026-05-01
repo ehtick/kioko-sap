@@ -13,8 +13,8 @@ pub mod dal;
 #[cfg(feature = "server")]
 pub mod scheduled_tasks;
 
-#[cfg(feature = "server")]
-mod constants;
+
+pub mod constants;
 
 // re-exports
 #[cfg(feature = "server")]

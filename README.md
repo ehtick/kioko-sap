@@ -6,6 +6,7 @@ This framework combines `Svelte`, `Axum`, `Postgres`, and `sqlx` with helpful ma
 
 - [DB Transactions](#db-transactions)
 - [Config Variables](#config-variables)
+- [Auth](#auth)
 - [Background Tasks](#background-tasks)
 - [Other things that are being worked on](#other-things-that-are-being-worked-on)
 
@@ -293,6 +294,738 @@ What happens here essentially is that the `LiveConfig::init()` loops through all
 It must be noted that every lookup clones the value at this point in time. This isn't too bad for now but will work on removing this and also removing the `to_string` requirement for passing in the key.
 
 
+## Auth
+
+Saps ships with cookie-based auth sessions backed by a row in `saps.auth_sessions` and a JWT that lives in an HttpOnly `saps-token` cookie. The cycle is:
+
+1. After a user logs in, you create an `AuthSession` row with whatever you want to remember about that session in its `meta` JSONB column (e.g. `user_id`, `user_role`, the department they're scoped to).
+2. You hand the user back a JWT whose `unique_id` is the session row's UUID, set as the `saps-token` cookie.
+3. On every subsequent request the `HeaderToken` extractor pulls the JWT, pings the session row (which extends `last_interacted` and rotates the UUID after 5 minutes of inactivity), and attaches the full `AuthSession` to the token before your handler runs.
+4. Your handler reads typed meta values directly off the token — no extra DB round-trip — and can update meta atomically via the same token.
+
+Login and logout get their own examples later in the docs. This section assumes a session has already been created and focuses on what your handlers do with it.
+
+### Auth lifecycle
+
+Every request that uses a `HeaderToken` extractor goes through the following inside `from_request_parts`:
+
+1. Extract the JWT from the `saps-token` cookie, the `token` header, or `Authorization: Bearer …` (in that order).
+2. Decode and verify the HS256 signature using `SECRET_KEY`.
+3. Call `saps.ping(10, session_id)`. This either bumps `last_interacted`, regenerates the session UUID once `date_created` is older than 5 minutes, or returns `NULL` for a session that's been idle for 10 minutes.
+4. Run the role check (e.g. `AdminRoleCheck`, `NoRoleCheck`) against the session's role.
+5. Stash the loaded `AuthSession` on the token and hand it to your handler.
+
+If step 3 rotated the UUID, the [middleware](#middleware) attaches a fresh `Set-Cookie` to the response automatically — your handler doesn't have to do anything special.
+
+### Reading session meta
+
+The `meta` column on `saps.auth_sessions` is a JSONB blob you control. Anything you put in there during login is available on the token without going back to the DB. Each accessor comes in two flavours:
+
+- **`_local`** — synchronous, reads the cached session attached to the token (what the extractor loaded). Fast, no DB round-trip.
+- **plain** — async, calls `refresh_auth_session` first so the read is up-to-the-instant. Use these when another task may have written to the session since the extractor ran.
+
+```rust
+use saps::auth::token::header_token::HeaderToken;
+
+// Cached read — no DB call.
+let user_id: i32 = token.meta_get_typed_strict_local("user_id")?;
+
+// Fresh read — refreshes the session row from the DB first.
+let user_id: i32 = token.meta_get_typed_strict("user_id").await?;
+
+// Optional value — returns Ok(None) if the key isn't there (no error).
+let project_id: Option<i32> = token.meta_get_typed_owned_local("project_id")?;
+
+// Borrowed deserialization — &str borrows from the cached Value, no allocation.
+let team: &str = token.meta_get_typed_strict_local("team")?;
+```
+
+The `_strict` variants return `SapsError` with status `NotFound` when the key is absent (or `BadRequest` when the value can't be decoded as `T`). The non-strict variants return `Result<Option<T>, SapsError>` — missing key is `Ok(None)`, decode failures are still errors. The `_owned` variants always allocate; the borrowed variants let `&str` and other zero-copy types share storage with the cached `Value`.
+
+### Updating session meta
+
+Every meta-mutation transaction in `tx_definitions.rs` has a wrapper on the token. Each one goes through `AuthPostGresDescriptor::<Z>` under the hood and refreshes the cached session on success, so a subsequent `_local` read sees the new value.
+
+```rust
+// Replace the whole meta blob.
+token.update_auth_session_meta(serde_json::json!({"user_id": 7})).await?;
+
+// Insert or overwrite a single key, leaving others intact.
+token.upsert_auth_session_meta_key("project_id", serde_json::json!(42)).await?;
+
+// Remove a key.
+token.delete_auth_session_meta_key("project_id").await?;
+
+// Atomic compare-and-swap. Returns true only if the swap actually happened.
+let won = token.compare_and_swap_auth_session_meta(
+    "nonce",
+    serde_json::json!("old"),
+    serde_json::json!("new"),
+).await?;
+```
+
+### Enforcing uniqueness on a meta key
+
+If you want at most one active session per user, install a partial unique index on `meta->>key` during migration:
+
+```rust
+use saps::auth::dal::model::AuthSession;
+use saps::dal::connections::LivePostGresPool;
+
+// Run after the base schema migration. Each entry in the slice creates one
+// partial unique index — sessions whose meta doesn't have the key are
+// excluded from the index, so unbound sessions never collide.
+AuthSession::<MyRole>::run_migration::<LivePostGresPool>(&["user_id"]).await?;
+```
+
+A duplicate insert against a covered key fails with `sqlx::Error::Database` whose `is_unique_violation()` is `true`.
+
+### Middleware
+
+When `saps.ping` rotates the session UUID, the extractor needs to send the new `saps-token` cookie back to the client. Apply [`attach_refreshed_cookie`](saps/src/auth/middleware/mod.rs) at the router level so this happens transparently:
+
+```rust
+use axum::{Router, middleware::from_fn, routing::post};
+use saps::auth::middleware::attach_refreshed_cookie;
+
+let app = Router::new()
+    .route("/api/v1/auth/validate-session", post(validate_session::<…>))
+    .layer(from_fn(attach_refreshed_cookie));
+```
+
+The layer installs a slot in the request extensions, the extractor writes the new cookie into that slot when a rotation happens, and the layer attaches the `Set-Cookie` to the response after the handler returns. It's a no-op when no rotation occurred, so it's safe to apply broadly — even on routes that don't use `HeaderToken`.
+
+### Role checks
+
+The second generic on `HeaderToken<X, Y, R, Z>` is the role-check strategy. Saps doesn't ship a fixed set of checks — you generate your own role enum and any number of check structs in one go with `construct_checks!`:
+
+```rust
+use saps::construct_checks;
+
+construct_checks!(
+    enum UserRoleCheck {
+        SuperAdmin,
+        Admin,
+        Customer,
+        Unreachable,
+    }
+    SuperAdminRoleCheck      => SuperAdmin,
+    AdminRoleCheck           => SuperAdmin | Admin,
+    CustomerRoleCheck        => SuperAdmin | Admin | Customer,
+    NoRoleCheck              => SuperAdmin | Admin | Customer,
+    ExactSuperAdminRoleCheck => SuperAdmin,
+    ExactAdminRoleCheck      => Admin,
+    ExactCustomerRoleCheck   => Customer
+);
+```
+
+The macro emits the `UserRoleCheck` enum (with `Display`, `TryFrom<String>`, and the `UserRole` impls saps needs) plus one unit struct per `Foo => …` line. Each check struct implements `CheckUserRole` and accepts only the listed variants — so `SuperAdminRoleCheck` accepts just `SuperAdmin`, `AdminRoleCheck` accepts `SuperAdmin` or `Admin`, the `Exact*` checks each accept exactly one variant, and `NoRoleCheck` accepts everything.
+
+The check fires in step 4 of the auth lifecycle, after the JWT decodes and the session row is loaded. A failed check rejects the request with `401 Unauthorized` before your handler body ever runs, so handlers that pin a specific role can safely ignore the token entirely:
+
+```rust
+use axum::{Json, http::StatusCode, response::IntoResponse};
+use saps::{
+    auth::token::header_token::HeaderToken,
+    config::GetConfigVariable,
+    dal::connections::YieldPostGresPool,
+    errors::saps::SapsError,
+};
+// `UserRoleCheck` and `SuperAdminRoleCheck` come from the construct_checks!
+// invocation above (typically re-exported from a kernel module in your crate).
+
+#[derive(serde::Deserialize)]
+pub struct DepartmentEmailLinkRequest {
+    pub email_id: i32,
+    pub department_id: i32,
+}
+
+pub async fn link_department_to_email<X, Z>(
+    _token: HeaderToken<X, SuperAdminRoleCheck, UserRoleCheck, Z>,
+    Json(payload): Json<DepartmentEmailLinkRequest>,
+) -> Result<impl IntoResponse, SapsError>
+where
+    X: GetConfigVariable + Send + Sync,
+    Z: YieldPostGresPool + Send + Sync,
+{
+    // Call your own DAL traits to actually create the link. Omitted here
+    // because they're application-specific.
+    let _ = (payload.email_id, payload.department_id);
+    Ok(StatusCode::CREATED)
+}
+```
+
+The handler ignores `_token` — its only job is to gate access. A non-`SuperAdmin` request never reaches this body.
+
+For a `db_test`, seed an `AuthSession` whose role matches the check, mint a `HeaderToken`, and `set_uuid` it to the seeded session's id. A small helper keeps the success and forbidden paths symmetric:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{HeaderValue, Request, StatusCode},
+        routing::post,
+    };
+    use saps::{
+        auth::dal::{model::AuthSession, tx_definitions::CreateAuthSession},
+        auth::token::header_token::HeaderToken,
+        dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
+        db_test, define_static_config,
+    };
+    use saps::sqlx::{Pool, Postgres, types::Uuid};
+    use tower::ServiceExt;
+
+    define_static_config!(
+        TestConfig,
+        "TOKEN_EXPIRE_MINS" => "20",
+        "SECRET_KEY" => "test-secret"
+    );
+
+    /// Persist an `AuthSession` with the supplied role and return its UUID.
+    /// Tests mint a `HeaderToken`, `set_uuid` it to this id, encode it, and
+    /// the extractor's `saps.ping` lands on this row — so the role check
+    /// runs against the role we seeded.
+    async fn seed_session_with_role<Y: YieldPostGresPool>(role: UserRoleCheck) -> Uuid {
+        let session = AuthSession::new(role);
+        let id = session.id;
+        AuthPostGresDescriptor::<Y>::create_auth_session::<UserRoleCheck>(session)
+            .await
+            .expect("create auth session");
+        id
+    }
+
+    /// Fire a request through the router using a JWT minted for `role`.
+    async fn fire_request<TestDbHandle: YieldPostGresPool>(role: UserRoleCheck) -> StatusCode {
+        let session_id = seed_session_with_role::<TestDbHandle>(role).await;
+
+        let jwt = HeaderToken::<TestConfig, SuperAdminRoleCheck, UserRoleCheck, TestDbHandle>
+            ::new::<UserRoleCheck>()
+            .expect("construct token")
+            .set_uuid(&session_id)
+            .encode()
+            .expect("encode jwt");
+
+        let app = Router::new().route(
+            "/link",
+            post(link_department_to_email::<TestConfig, TestDbHandle>),
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/link")
+            .header(
+                "Cookie",
+                HeaderValue::from_str(&format!("saps-token={jwt}"))
+                    .expect("cookie header"),
+            )
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"email_id":1,"department_id":1}"#))
+            .expect("build request");
+
+        app.oneshot(request).await.expect("send").status()
+    }
+
+    #[db_test]
+    async fn test_link_department_to_email_ok<TestDbHandle: YieldPostGresPool>(
+        _pool: &Pool<Postgres>,
+    ) {
+        // SuperAdmin satisfies SuperAdminRoleCheck — handler runs, returns 201.
+        assert_eq!(
+            fire_request::<TestDbHandle>(UserRoleCheck::SuperAdmin).await,
+            StatusCode::CREATED,
+        );
+    }
+
+    #[db_test]
+    async fn test_link_department_to_email_forbidden_for_customer<TestDbHandle: YieldPostGresPool>(
+        _pool: &Pool<Postgres>,
+    ) {
+        // Customer does not satisfy SuperAdminRoleCheck — the extractor rejects
+        // with 401 before the handler body runs.
+        assert_eq!(
+            fire_request::<TestDbHandle>(UserRoleCheck::Customer).await,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+}
+```
+
+Note that calling the handler function directly (without going through the router) bypasses the extractor and therefore the role check — direct calls only test the body. Going through `oneshot` exercises the same path a real request takes, including the role check.
+
+### Login
+
+Login is the one handler that *creates* the session — every other handler in this section reads it. The flow is the same regardless of how you check the user's identity (password, OAuth, magic link…): once you've decided who they are, build an `AuthSession` with whatever meta your handlers will need, mint a JWT whose `unique_id` matches the session's UUID, persist the session, and return both a `Set-Cookie` and the encoded token in the body.
+
+```rust
+use axum::{
+    Json,
+    body::{self, Body},
+    http::{Request, StatusCode},
+    response::IntoResponse,
+};
+use saps::{
+    auth::{
+        dal::{model::AuthSession, tx_definitions::CreateAuthSession},
+        token::{cookies::AuthTokenCookie, header_token::HeaderToken},
+        utils::extract_credentials::extract_credentials,
+    },
+    config::GetConfigVariable,
+    dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
+    errors::saps::SapsError,
+};
+// `UserRoleCheck` and `NoRoleCheck` come from the construct_checks!
+// invocation in the Role checks section above.
+
+#[derive(serde::Deserialize)]
+pub struct LoginBody {
+    pub role: UserRoleCheck,
+}
+
+#[derive(serde::Serialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub role: UserRoleCheck,
+}
+
+pub async fn login<X, Z>(mut req: Request<Body>) -> Result<impl IntoResponse, SapsError>
+where
+    X: GetConfigVariable,
+    Z: YieldPostGresPool,
+{
+    // 1. Pull `email`/`password` from the `Authorization: Basic …` header.
+    let credentials = extract_credentials(&req)?;
+
+    // 2. Read the requested role from the JSON body.
+    let raw_body = std::mem::take(req.body_mut());
+    let bytes = body::to_bytes(raw_body, usize::MAX)
+        .await
+        .map_err(|e| SapsError::bad_request(e.to_string()))?;
+    let parsed: LoginBody =
+        serde_json::from_slice(&bytes).map_err(|e| SapsError::bad_request(e.to_string()))?;
+
+    // 3. Do specific app checks here — look up the user by email, verify the
+    //    password hash, decide whether the user is allowed to assume the
+    //    requested role, etc. Omitted because it's all application-specific.
+    let _ = credentials;
+    let user_id: i32 = 1;
+
+    // 4. Build the auth_session row with whatever meta your handlers will
+    //    read off the token later.
+    let user_role = parsed.role;
+    let meta = serde_json::json!({
+        "user_id": user_id,
+        "user_role": user_role,
+    });
+    let auth_session = AuthSession::new(user_role).with_meta(meta);
+
+    // 5. Mint a JWT whose unique_id matches the auth_session's UUID. The
+    //    extractor pings into this row on every subsequent request.
+    let token = HeaderToken::<X, NoRoleCheck, UserRoleCheck, Z>::new::<UserRoleCheck>()?
+        .set_uuid(&auth_session.id);
+
+    // 6. Persist the session.
+    AuthPostGresDescriptor::<Z>::create_auth_session::<UserRoleCheck>(auth_session).await?;
+
+    // 7. Encode the token and turn it into a Set-Cookie header.
+    let encoded = token.encode()?;
+    let headers = AuthTokenCookie::from(&encoded).generate_header()?;
+
+    Ok((
+        StatusCode::OK,
+        headers,
+        Json(LoginResponse { token: encoded, role: user_role }),
+    ))
+}
+```
+
+Steps 4–7 are the saps-specific bit; everything before is just authentication. Build the session, mint a token bound to its UUID, persist the row, and ship both cookie + token. The token in the body lets non-browser clients (mobile apps, CLIs) read it; the cookie is for browsers.
+
+A `db_test` fires the real route through `oneshot`, decodes the response JWT, and asserts the auth_session row exists in the DB with the right role and meta:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode, header},
+        routing::post,
+    };
+    use base64::{Engine, engine::general_purpose};
+    use saps::{
+        auth::dal::tx_definitions::GetAuthSessionStrict,
+        auth::token::header_token::HeaderToken,
+        dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
+        db_test, define_static_config,
+    };
+    use saps::sqlx::{Pool, Postgres};
+    use tower::ServiceExt;
+
+    define_static_config!(
+        TestConfig,
+        "TOKEN_EXPIRE_MINS" => "30",
+        "SECRET_KEY" => "test-secret"
+    );
+
+    fn login_request(email: &str, password: &str, role: UserRoleCheck) -> Request<Body> {
+        let creds = general_purpose::STANDARD.encode(format!("{email}:{password}"));
+        let body = serde_json::to_vec(&LoginBody { role })
+            .expect("serialize login body");
+        Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::AUTHORIZATION, format!("Basic {creds}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("build request")
+    }
+
+    #[db_test]
+    async fn test_login_creates_session<TestDbHandle: YieldPostGresPool>(
+        _pool: &Pool<Postgres>,
+    ) {
+        let app = Router::new().route(
+            "/login",
+            post(login::<TestConfig, TestDbHandle>),
+        );
+
+        let response = app
+            .oneshot(login_request("alice@example.com", "hunter2", UserRoleCheck::Customer))
+            .await
+            .expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Set-Cookie carries the saps-token for browsers.
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("login should set the auth cookie")
+            .to_str()
+            .expect("utf-8")
+            .to_string();
+        assert!(cookie.contains("saps-token="));
+
+        // Body carries the same JWT for non-browser clients.
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let login: LoginResponse = serde_json::from_slice(&bytes).expect("decode response");
+        assert_eq!(login.role, UserRoleCheck::Customer);
+
+        // The response JWT decodes back to a token whose unique_id keys into
+        // the auth_session row login just wrote.
+        let decoded = HeaderToken::<TestConfig, NoRoleCheck, UserRoleCheck, TestDbHandle>
+            ::decode(&login.token)
+            .expect("decode response token");
+
+        let session = AuthPostGresDescriptor::<TestDbHandle>
+            ::get_auth_session_strict::<UserRoleCheck>(&decoded.unique_id)
+            .await
+            .expect("session should exist");
+
+        assert_eq!(session.role, UserRoleCheck::Customer);
+        let meta_user_id: i32 = session
+            .meta_get_typed_strict("user_id")
+            .expect("user_id present in meta");
+        assert_eq!(meta_user_id, 1);
+    }
+}
+```
+
+Hitting `/login` twice for the same user creates two separate `auth_session` rows — saps doesn't dedupe by user, since the session UUID is what the JWT is bound to. If you want at most one active session per user, install a partial unique index on `meta->>'user_id'` (see [Enforcing uniqueness on a meta key](#enforcing-uniqueness-on-a-meta-key)) — the second insert will fail with a unique-violation.
+
+### Logout
+
+Logout is a thin handler: delete the session row and clear the auth cookie. Any logged-in role should be able to log out, so the route uses `NoRoleCheck`. `token.delete_auth_session()` wraps the DAL delete, and `AuthTokenCookie::from("").wipe_from_cookies()` produces the `Set-Cookie` headers that tell the browser to drop `saps-token` (the wrapped value is ignored — `wipe_from_cookies` only emits the clearing cookie):
+
+```rust
+use axum::{http::StatusCode, response::IntoResponse};
+use saps::{
+    auth::token::{cookies::AuthTokenCookie, header_token::HeaderToken},
+    config::GetConfigVariable,
+    dal::connections::YieldPostGresPool,
+    errors::saps::SapsError,
+};
+// `UserRoleCheck` and `NoRoleCheck` come from the construct_checks!
+// invocation in the Role checks section above.
+
+pub async fn logout<X, Z>(
+    token: HeaderToken<X, NoRoleCheck, UserRoleCheck, Z>,
+) -> Result<impl IntoResponse, SapsError>
+where
+    X: GetConfigVariable,
+    Z: YieldPostGresPool,
+{
+    token.delete_auth_session().await?;
+    let headers = AuthTokenCookie::from("").wipe_from_cookies()?;
+    Ok((StatusCode::OK, headers))
+}
+```
+
+The DB row deletion alone doesn't tell the client anything — the clearing cookie is what makes the browser stop sending `saps-token` on subsequent requests. `wipe_from_cookies` emits a `Set-Cookie: saps-token=; Max-Age=0; …` header with the same `HttpOnly`/`Path` attributes saps uses on login, so the browser actually evicts the cookie.
+
+A `db_test` is most realistic if it logs in to get a real cookie and then sends that cookie to `/logout` — this exercises the full round-trip the way a browser would. It also covers the unauthenticated path where no cookie is sent and the extractor rejects with 401 before the handler body runs:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // The `login` handler from the previous section.
+    use crate::login;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode, header},
+        routing::post,
+    };
+    use base64::{Engine, engine::general_purpose};
+    use saps::{
+        auth::dal::tx_definitions::GetAllAuthSessions,
+        constants::AUTH_TOKEN_COOKIE_KEY,
+        dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
+        db_test, define_static_config,
+    };
+    use saps::sqlx::{Pool, Postgres};
+    use tower::ServiceExt;
+
+    define_static_config!(
+        TestConfig,
+        "TOKEN_EXPIRE_MINS" => "30",
+        "SECRET_KEY" => "test-secret"
+    );
+
+    /// Strip everything after the first `;` so we can put the cookie on a
+    /// follow-up request — `Cookie` headers want just `name=value` pairs,
+    /// not the attribute soup browsers receive in `Set-Cookie`.
+    fn cookie_kv_only(set_cookie: &str) -> String {
+        set_cookie.split(';').next().unwrap_or(set_cookie).trim().to_string()
+    }
+
+    fn login_request() -> Request<Body> {
+        let creds = general_purpose::STANDARD.encode("alice@example.com:hunter2");
+        let body = serde_json::to_vec(&LoginBody { role: UserRoleCheck::Customer })
+            .expect("serialize login body");
+        Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::AUTHORIZATION, format!("Basic {creds}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("build login request")
+    }
+
+    #[db_test]
+    async fn test_logout_clears_cookie_and_deletes_session<TestDbHandle: YieldPostGresPool>(
+        _pool: &Pool<Postgres>,
+    ) {
+        // Mount login + logout on the same router so we can chain them.
+        let app = Router::new()
+            .route("/login", post(login::<TestConfig, TestDbHandle>))
+            .route("/logout", post(logout::<TestConfig, TestDbHandle>));
+
+        // 1. Log in and capture the cookie that login set.
+        let login_resp = app.clone()
+            .oneshot(login_request())
+            .await
+            .expect("login");
+        assert_eq!(login_resp.status(), StatusCode::OK);
+        let set_cookie = login_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("login set-cookie")
+            .to_str()
+            .expect("utf-8")
+            .to_string();
+        let cookie = cookie_kv_only(&set_cookie);
+
+        // Sanity: login created exactly one auth_session row.
+        let sessions =
+            AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<UserRoleCheck>()
+                .await
+                .expect("get all sessions");
+        assert_eq!(sessions.len(), 1);
+
+        // 2. Send the cookie to /logout.
+        let logout_req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("build logout request");
+
+        let logout_resp = app.oneshot(logout_req).await.expect("logout");
+
+        // 3. 200, Set-Cookie clears the auth cookie, and the session row is gone.
+        assert_eq!(logout_resp.status(), StatusCode::OK);
+        let cleared = logout_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("logout set-cookie")
+            .to_str()
+            .expect("utf-8");
+        assert!(cleared.contains(&format!("{AUTH_TOKEN_COOKIE_KEY}=")));
+        assert!(cleared.contains("Max-Age=0"));
+
+        let sessions =
+            AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<UserRoleCheck>()
+                .await
+                .expect("get all sessions");
+        assert!(sessions.is_empty(), "session should be deleted after logout");
+    }
+
+    #[db_test]
+    async fn test_logout_without_cookie_is_unauthorized<TestDbHandle: YieldPostGresPool>(
+        _pool: &Pool<Postgres>,
+    ) {
+        let app = Router::new().route("/logout", post(logout::<TestConfig, TestDbHandle>));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .body(Body::empty())
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("send");
+        // The extractor can't find a JWT in cookies/headers and rejects with 401.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+```
+
+Note the `cookie_kv_only` helper: `Set-Cookie` headers in responses include attributes like `HttpOnly; Path=/; Max-Age=…`, but the `Cookie` header on a subsequent request only wants `name=value` pairs. Stripping at the first `;` gives you exactly what the browser would echo back.
+
+### Putting it together
+
+A handler that returns the caller's session meta:
+
+```rust
+use axum::{Json, http::StatusCode, response::IntoResponse};
+use saps::{
+    auth::token::{
+        checks::{NoRoleCheck, UserRole},
+        header_token::HeaderToken,
+    },
+    config::GetConfigVariable,
+    dal::connections::YieldPostGresPool,
+    errors::saps::{SapsError, SapsErrorStatus},
+};
+
+#[derive(serde::Serialize)]
+struct SessionResponse {
+    user_id: i32,
+    project_id: Option<i32>,
+}
+
+pub async fn validate_session<X, Z, R>(
+    mut token: HeaderToken<X, NoRoleCheck, R, Z>,
+) -> Result<impl IntoResponse, SapsError>
+where
+    X: GetConfigVariable,
+    Z: YieldPostGresPool,
+    R: UserRole,
+{
+    // Required key — falls through as NotFound if missing.
+    let user_id: i32 = token.meta_get_typed_strict("user_id").await?;
+
+    // Optional key — convert NotFound into None, propagate everything else.
+    let project_id: Option<i32> = match token.meta_get_typed_strict_local("project_id") {
+        Ok(id) => Some(id),
+        Err(err) if err.status == SapsErrorStatus::NotFound => None,
+        Err(err) => return Err(err),
+    };
+
+    Ok((StatusCode::OK, Json(SessionResponse { user_id, project_id })))
+}
+```
+
+Note that the first read is `meta_get_typed_strict` (async, refreshes from the DB) so we have the freshest copy on the token, and the second read is `_local` because we already refreshed for the first call — no need to round-trip again.
+
+### Testing
+
+`#[db_test]` gives you an isolated postgres DB per test. Insert an `AuthSession` directly, build a JWT for it, and fire a request. The extractor will load the session row, populate the token's meta, and your handler runs against real data:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{HeaderValue, Request, StatusCode},
+        routing::post,
+    };
+    use saps::{
+        auth::dal::model::AuthSession,
+        auth::dal::tx_definitions::CreateAuthSession,
+        auth::token::{
+            checks::{NoRoleCheck, construct_checks},
+            header_token::HeaderToken,
+        },
+        dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
+        db_test, define_static_config,
+    };
+    use saps::sqlx::{Pool, Postgres};
+    use tower::ServiceExt;
+
+    construct_checks!(
+        enum TestRole {
+            Customer,
+        }
+    );
+
+    define_static_config!(
+        TestConfig,
+        "TOKEN_EXPIRE_MINS" => "20",
+        "SECRET_KEY" => "test-secret"
+    );
+
+    #[db_test]
+    async fn test_validate_session_ok<TestDbHandle: YieldPostGresPool>(pool: &Pool<Postgres>) {
+        // 1. Insert a session with the meta our handler will read.
+        let session = AuthSession::new(TestRole::Customer)
+            .with_meta(serde_json::json!({"user_id": 1, "project_id": 42}));
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        // 2. Build a JWT whose unique_id matches the session row.
+        let token = HeaderToken::<TestConfig, NoRoleCheck, TestRole, TestDbHandle>
+            ::new::<TestRole>()
+            .expect("new token")
+            .set_uuid(&created.id);
+        let jwt = token.encode().expect("encode jwt");
+
+        // 3. Mount the handler and fire a request with the JWT in the cookie.
+        let app = Router::new().route(
+            "/validate",
+            post(validate_session::<TestConfig, TestDbHandle, TestRole>),
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/validate")
+            .header(
+                "Cookie",
+                HeaderValue::from_str(&format!("saps-token={jwt}"))
+                    .expect("cookie header"),
+            )
+            .body(Body::empty())
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+```
+
+`define_static_config!` is enough for testing because the extractor only needs `TOKEN_EXPIRE_MINS` and `SECRET_KEY`. Use `define_env_config!` (see [Config Variables](#config-variables)) in production.
+
+
 ## Background Tasks
 
 The persistence of background tasks is handled in a non-public schema in postgres. With saps, we can shoot off random background tasks to the execution queue and you can also schedule background tasks for individual times or periods. First, we need the following imports:
@@ -413,6 +1146,4 @@ Note that the `::<LivePostGresPool>` was added to the `add` function. This is be
 
 
 ## Other things that are being worked on
-
-- cookie based auth sessions with role checks.
 
