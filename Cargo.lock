@@ -1738,7 +1738,7 @@ dependencies = [
  "saps-background-task 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-pool-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-tx 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "saps-frontend-macro 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "saps-frontend-macro 0.1.0",
  "saps-test-macro 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
@@ -1817,6 +1817,8 @@ dependencies = [
 [[package]]
 name = "saps-frontend-macro"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ff2b9784ad0615af920579bed795d219f90758007f6dfbc6cc850d730b795b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1825,9 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "saps-frontend-macro"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ff2b9784ad0615af920579bed795d219f90758007f6dfbc6cc850d730b795b"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
