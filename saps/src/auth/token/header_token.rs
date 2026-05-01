@@ -70,7 +70,13 @@
 //! ```
 use crate::{
     auth::{
-        dal::tx_definitions::{DeleteAuthSession, PingAuthSession},
+        dal::{
+            model::AuthSession,
+            tx_definitions::{
+                DeleteAuthSession, DeleteAuthSessionMetaKey, PingAuthSession,
+                UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+            },
+        },
         middleware::CookieSlot,
         token::{
             checks::{CheckUserRole, UserRole},
@@ -92,7 +98,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use uuid::Uuid;
 
@@ -133,7 +139,7 @@ pub struct UpdatedAuthCookie(pub String);
 /// | `role_handle` | No | Phantom marker for the role-check strategy `Y` |
 /// | `db_handle` | No | Phantom marker for the database pool provider `Z` |
 /// | `role` | No | Phantom marker for the concrete role enum `R` |
-/// | `meta` | No | Session metadata loaded from the DB during extraction |
+/// | `auth_session` | No | The full [`AuthSession`] loaded from the DB during extraction |
 /// | `old_uuid` | No | The previous UUID when the extractor rotated the session, otherwise `None` |
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> {
@@ -155,11 +161,15 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     /// Phantom marker for the concrete role enum type `R`.
     #[serde(skip)]
     pub role: PhantomData<R>,
-    /// Optional session metadata loaded from the `meta` JSONB column in
-    /// `saps.auth_sessions` during extraction. This is `None` for freshly
-    /// created tokens and is populated by the [`FromRequestParts`] implementation.
-    #[serde(skip)]
-    pub meta: Option<serde_json::Value>,
+    /// The session row loaded from `saps.auth_sessions` during extraction.
+    ///
+    /// `None` for freshly created tokens; the [`FromRequestParts`] impl
+    /// populates this with the row returned by `saps.ping`. Handlers can
+    /// reach the meta JSON via `auth_session.meta` (or the typed
+    /// `AuthSession::meta_get*` helpers) and call further DAL operations
+    /// without re-fetching the session.
+    #[serde(skip, default = "Option::default")]
+    pub auth_session: Option<AuthSession<R>>,
     /// The previous UUID, populated only when the extractor detected a session
     /// rotation during [`FromRequestParts`]. `None` for freshly created tokens
     /// and for requests where no rotation occurred. Not part of the JWT payload —
@@ -198,7 +208,7 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
             role_handle: PhantomData,
             db_handle: PhantomData,
             role: PhantomData,
-            meta: None,
+            auth_session: None,
             old_uuid: None,
         })
     }
@@ -229,6 +239,20 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
         }
     }
 
+    /// Returns a reference to the [`AuthSession`] populated by the extractor.
+    ///
+    /// Errors if the token has not been extracted yet (i.e. it was created
+    /// via [`new`](Self::new) and has not gone through [`FromRequestParts`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if `auth_session` is `None`.
+    pub fn get_auth_session(&self) -> Result<&AuthSession<R>, SapsError> {
+        self.auth_session
+            .as_ref()
+            .ok_or_else(|| SapsError::bad_request("auth session not present on token"))
+    }
+
     /// Returns a reference to the session metadata, or an error if it was not populated.
     ///
     /// Metadata is loaded from the `meta` JSONB column in `saps.auth_sessions` during
@@ -237,9 +261,11 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     ///
     /// # Errors
     ///
-    /// Returns [`SapsError::bad_request`] if `meta` is `None`.
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded, or its `meta` column is `NULL`.
     pub fn get_meta(&self) -> Result<&serde_json::Value, SapsError> {
-        self.meta
+        self.get_auth_session()?
+            .meta
             .as_ref()
             .ok_or_else(|| SapsError::bad_request("session meta not present"))
     }
@@ -263,6 +289,183 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
             .map_err(|e| SapsError::unknown(e.to_string()))?;
         let deleted = AuthPostGresDescriptor::<Z>::delete_auth_session(session_id).await?;
         Ok(deleted)
+    }
+
+    /// Replaces the entire `meta` JSON for this token's auth session.
+    ///
+    /// Wraps [`AuthPostGresDescriptor::<Z>::update_auth_session_meta`] using
+    /// the token's `unique_id`. The cached [`auth_session`](Self::auth_session)
+    /// is updated in place to reflect the new meta value, so subsequent reads
+    /// via [`get_meta`](Self::get_meta) or
+    /// [`get_auth_session`](Self::get_auth_session) see the change without an
+    /// extra DB round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the database query fails.
+    pub async fn update_auth_session_meta(
+        &mut self,
+        meta: serde_json::Value,
+    ) -> Result<(), SapsError> {
+        AuthPostGresDescriptor::<Z>::update_auth_session_meta(&self.unique_id, meta.clone())
+            .await?;
+        if let Some(session) = self.auth_session.as_mut() {
+            session.meta = Some(meta);
+        }
+        Ok(())
+    }
+
+    /// Sets a single top-level `key` in the auth session's `meta`, leaving all
+    /// other keys intact.
+    ///
+    /// Wraps [`AuthPostGresDescriptor::<Z>::upsert_auth_session_meta_key`].
+    /// When the DAL returns the post-update row, the cached
+    /// [`auth_session`](Self::auth_session) is replaced with it; if the row
+    /// no longer exists, the cached session is left untouched and the call
+    /// is a silent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the database query fails.
+    pub async fn upsert_auth_session_meta_key(
+        &mut self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), SapsError> {
+        let updated = AuthPostGresDescriptor::<Z>::upsert_auth_session_meta_key::<R>(
+            &self.unique_id,
+            key,
+            value,
+        )
+        .await?;
+        if let Some(session) = updated {
+            self.auth_session = Some(session);
+        }
+        Ok(())
+    }
+
+    /// Removes a single top-level `key` from the auth session's `meta`,
+    /// leaving all other keys intact.
+    ///
+    /// Wraps [`AuthPostGresDescriptor::<Z>::delete_auth_session_meta_key`].
+    /// When the DAL returns the post-update row, the cached
+    /// [`auth_session`](Self::auth_session) is replaced with it; if the row
+    /// no longer exists, the cached session is left untouched and the call
+    /// is a silent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the database query fails.
+    pub async fn delete_auth_session_meta_key(&mut self, key: &str) -> Result<(), SapsError> {
+        let updated = AuthPostGresDescriptor::<Z>::delete_auth_session_meta_key::<R>(
+            &self.unique_id,
+            key,
+        )
+        .await?;
+        if let Some(session) = updated {
+            self.auth_session = Some(session);
+        }
+        Ok(())
+    }
+
+    /// Forwards to [`AuthSession::meta_get`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token (i.e. the extractor hasn't run).
+    pub fn meta_get(&self, key: &str) -> Result<Option<&serde_json::Value>, SapsError> {
+        Ok(self.get_auth_session()?.meta_get(key))
+    }
+
+    /// Forwards to [`AuthSession::meta_get_owned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token.
+    pub fn meta_get_owned(&self, key: &str) -> Result<Option<serde_json::Value>, SapsError> {
+        Ok(self.get_auth_session()?.meta_get_owned(key))
+    }
+
+    /// Forwards to [`AuthSession::meta_get_strict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token, or [`SapsError::not_found`] if `key` is not
+    /// present in `meta`.
+    pub fn meta_get_strict(&self, key: &str) -> Result<&serde_json::Value, SapsError> {
+        self.get_auth_session()?.meta_get_strict(key)
+    }
+
+    /// Forwards to [`AuthSession::meta_get_strict_owned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token, or [`SapsError::not_found`] if `key` is not
+    /// present in `meta`.
+    pub fn meta_get_strict_owned(&self, key: &str) -> Result<serde_json::Value, SapsError> {
+        self.get_auth_session()?.meta_get_strict_owned(key)
+    }
+
+    /// Forwards to [`AuthSession::meta_get_typed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token, or if the value at `key` cannot be decoded
+    /// as `T`.
+    pub fn meta_get_typed<'a, T>(&'a self, key: &str) -> Result<Option<T>, SapsError>
+    where
+        T: Deserialize<'a>,
+    {
+        self.get_auth_session()?.meta_get_typed(key)
+    }
+
+    /// Forwards to [`AuthSession::meta_get_typed_owned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token, or if the value at `key` cannot be decoded
+    /// as `T`.
+    pub fn meta_get_typed_owned<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, SapsError> {
+        self.get_auth_session()?.meta_get_typed_owned(key)
+    }
+
+    /// Forwards to [`AuthSession::meta_get_typed_strict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token, [`SapsError::not_found`] if `key` is not
+    /// present in `meta`, or [`SapsError::bad_request`] if the value cannot
+    /// be decoded as `T`.
+    pub fn meta_get_typed_strict<'a, T>(&'a self, key: &str) -> Result<T, SapsError>
+    where
+        T: Deserialize<'a>,
+    {
+        self.get_auth_session()?.meta_get_typed_strict(key)
+    }
+
+    /// Forwards to [`AuthSession::meta_get_typed_strict_owned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError::bad_request`] if the auth session has not been
+    /// loaded onto this token, [`SapsError::not_found`] if `key` is not
+    /// present in `meta`, or [`SapsError::bad_request`] if the value cannot
+    /// be decoded as `T`.
+    pub fn meta_get_typed_strict_owned<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<T, SapsError> {
+        self.get_auth_session()?.meta_get_typed_strict_owned(key)
     }
 
     /// Encodes this token into a signed HS256 JWT string.
@@ -558,7 +761,7 @@ where
             token = Self::decode(&new_jwt)?;
             token.old_uuid = Some(existing_id);
         }
-        token.meta = session.meta;
+        token.auth_session = Some(session);
         Ok(token)
     }
 }
