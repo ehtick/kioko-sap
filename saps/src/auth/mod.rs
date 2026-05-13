@@ -8,7 +8,9 @@ pub mod utils;
 // builds that don't opt in.
 #[cfg(feature = "auth-tracing")]
 macro_rules! auth_trace {
-    ($($arg:tt)*) => { ::tracing::trace!(target: "saps::auth", $($arg)*) };
+    ($($arg:tt)*) => {
+        ::tracing::trace!(target: "saps::auth", system = "saps-auth", $($arg)*)
+    };
 }
 #[cfg(not(feature = "auth-tracing"))]
 macro_rules! auth_trace {

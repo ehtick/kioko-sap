@@ -434,21 +434,27 @@ Or set it via the environment without code changes:
 RUST_LOG="saps::auth=trace" cargo run
 ```
 
-Every event from the auth flow carries `method` and `uri`; everything past the JWT decode also carries `session_id`; rotations additionally carry `new_session_id`. A typical request that triggers a rotation looks like this:
+Every event from the auth flow carries `system="saps-auth"` (a constant tag for `grep` / log-aggregator filtering), `method`, and `uri`; everything past the JWT decode also carries `session_id`; rotations additionally carry `new_session_id`. A typical request that triggers a rotation looks like this:
 
 ```text
-TRACE saps::auth: attach_refreshed_cookie — installing CookieSlot method=POST uri=/api/v1/me
-TRACE saps::auth: from_request_parts — auth flow start method=POST uri=/api/v1/me
-TRACE saps::auth: from_request_parts — JWT located method=POST uri=/api/v1/me source=cookie
-TRACE saps::auth: decoded JWT session_id=8b1e… time_expire=2026-05-13T12:54:56Z
-TRACE saps::auth: from_request_parts — JWT decoded, pinging session method=POST uri=/api/v1/me session_id=8b1e… time_expire=2026-05-13T12:54:56Z
-TRACE saps::auth: from_request_parts — ping returned session method=POST uri=/api/v1/me session_id=8b1e… returned_session_id=4f2a… role=admin date_created=2026-05-13T12:29:11Z last_interacted=2026-05-13T12:34:55Z meta=Some(Object {"user_id": Number(42)})
-TRACE saps::auth: from_request_parts — role check passed method=POST uri=/api/v1/me session_id=8b1e… role=admin
-TRACE saps::auth: from_request_parts — ROTATION detected, refreshing JWT and cookie method=POST uri=/api/v1/me session_id=8b1e… new_session_id=4f2a…
-TRACE saps::auth: encoding JWT session_id=4f2a… time_expire=2026-05-13T12:54:56Z
-TRACE saps::auth: from_request_parts — handing refreshed cookie to CookieSlot method=POST uri=/api/v1/me session_id=4f2a…
-TRACE saps::auth: from_request_parts — auth flow complete method=POST uri=/api/v1/me session_id=4f2a… rotated=true
-TRACE saps::auth: attach_refreshed_cookie — attaching Set-Cookie (rotation occurred) method=POST uri=/api/v1/me cookie=saps-token=…; HttpOnly; Path=/; Max-Age=… status=200 OK
+TRACE saps::auth: attach_refreshed_cookie — installing CookieSlot system="saps-auth" method=POST uri=/api/v1/me
+TRACE saps::auth: from_request_parts — auth flow start system="saps-auth" method=POST uri=/api/v1/me
+TRACE saps::auth: from_request_parts — JWT located system="saps-auth" method=POST uri=/api/v1/me source=cookie
+TRACE saps::auth: decoded JWT system="saps-auth" session_id=8b1e… time_expire=2026-05-13T12:54:56Z
+TRACE saps::auth: from_request_parts — JWT decoded, pinging session system="saps-auth" method=POST uri=/api/v1/me session_id=8b1e… time_expire=2026-05-13T12:54:56Z
+TRACE saps::auth: from_request_parts — ping returned session system="saps-auth" method=POST uri=/api/v1/me session_id=8b1e… returned_session_id=4f2a… role=admin date_created=2026-05-13T12:29:11Z last_interacted=2026-05-13T12:34:55Z meta=Some(Object {"user_id": Number(42)})
+TRACE saps::auth: from_request_parts — role check passed system="saps-auth" method=POST uri=/api/v1/me session_id=8b1e… role=admin
+TRACE saps::auth: from_request_parts — ROTATION detected, refreshing JWT and cookie system="saps-auth" method=POST uri=/api/v1/me session_id=8b1e… new_session_id=4f2a…
+TRACE saps::auth: encoding JWT system="saps-auth" session_id=4f2a… time_expire=2026-05-13T12:54:56Z
+TRACE saps::auth: from_request_parts — handing refreshed cookie to CookieSlot system="saps-auth" method=POST uri=/api/v1/me session_id=4f2a…
+TRACE saps::auth: from_request_parts — auth flow complete system="saps-auth" method=POST uri=/api/v1/me session_id=4f2a… rotated=true
+TRACE saps::auth: attach_refreshed_cookie — attaching Set-Cookie (rotation occurred) system="saps-auth" method=POST uri=/api/v1/me cookie=saps-token=…; HttpOnly; Path=/; Max-Age=… status=200 OK
+```
+
+To pull just the auth lines out of a mixed log stream:
+
+```bash
+grep 'system="saps-auth"' app.log
 ```
 
 Failure paths emit the same shape with an `error` field — `JWT decode failed`, `session not present in DB`, `role check FAILED`, `ping_auth_session DB call failed`. The rotation path also emits a loud warning when no `CookieSlot` is installed in the request extensions (`client will NOT receive new cookie`) — that's the giveaway that the [`attach_refreshed_cookie`](#middleware) layer isn't mounted on a route that needs it.
