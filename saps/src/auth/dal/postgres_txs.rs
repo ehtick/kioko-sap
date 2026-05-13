@@ -76,8 +76,8 @@ async fn create_auth_session<U: UserRole>(session: AuthSession<U>) -> AuthSessio
     let pool = T::yield_pool();
     let row = sqlx::query(
         r#"
-        INSERT INTO saps.auth_sessions (id, role, date_created, last_interacted, meta)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO saps.auth_sessions (id, old_id, role, date_created, last_interacted, time_minted, meta)
+        VALUES ($1, $1, $2, $3, $4, $3, $5)
         RETURNING id, role, date_created, last_interacted, meta
         "#,
     )
@@ -641,4 +641,323 @@ async fn delete_auth_session(session_id: uuid::Uuid) -> bool {
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+// MARK: - Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::dal::tx_definitions::{CreateAuthSession, PingAuthSession};
+    use crate::errors::saps::SapsError;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    enum TestRole {
+        Admin,
+        Customer,
+    }
+
+    impl std::fmt::Display for TestRole {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TestRole::Admin => write!(f, "admin"),
+                TestRole::Customer => write!(f, "customer"),
+            }
+        }
+    }
+
+    impl TryFrom<String> for TestRole {
+        type Error = SapsError;
+        fn try_from(value: String) -> Result<Self, Self::Error> {
+            match value.to_lowercase().as_str() {
+                "admin" => Ok(TestRole::Admin),
+                "customer" => Ok(TestRole::Customer),
+                _ => Err(SapsError::bad_request(format!("Unknown role: {}", value))),
+            }
+        }
+    }
+
+    impl crate::auth::token::checks::UserRole for TestRole {}
+
+    /// Fetches the raw `id`, `old_id`, and `time_minted` for a session via
+    /// `last_interacted` lookup. The id may have rotated, so we look up the
+    /// single row that exists.
+    async fn fetch_row_state(
+        pool: &saps::sqlx::Pool<saps::sqlx::Postgres>,
+    ) -> (uuid::Uuid, uuid::Uuid, chrono::NaiveDateTime) {
+        let row = saps::sqlx::query(
+            "SELECT id, old_id, time_minted FROM saps.auth_sessions LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("fetch row state");
+        let id: uuid::Uuid = saps::sqlx::Row::try_get(&row, "id").expect("id");
+        let old_id: uuid::Uuid = saps::sqlx::Row::try_get(&row, "old_id").expect("old_id");
+        let time_minted: chrono::NaiveDateTime =
+            saps::sqlx::Row::try_get(&row, "time_minted").expect("time_minted");
+        (id, old_id, time_minted)
+    }
+
+    #[saps::db_test]
+    async fn test_create_initialises_old_id_to_id() {
+        let session = AuthSession::new(TestRole::Admin);
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        let (id, old_id, _time_minted) = fetch_row_state(pool).await;
+        assert_eq!(id, created.id);
+        assert_eq!(old_id, created.id);
+    }
+
+    #[saps::db_test]
+    async fn test_rotation_sets_old_id_and_resets_time_minted() {
+        let session = AuthSession::new(TestRole::Admin);
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        // Backdate so the next ping triggers rotation (date_created > 5 mins).
+        // time_minted is also backdated so we can confirm rotation refreshes it.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET date_created = NOW() - INTERVAL '10 minutes', \
+                 time_minted = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(created.id)
+        .execute(pool)
+        .await
+        .expect("backdate session");
+
+        let pinged = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+            30,
+            &created.id.to_string(),
+        )
+        .await
+        .expect("ping session")
+        .expect("session should exist");
+
+        assert_ne!(pinged.id, created.id, "id should have rotated");
+
+        let (db_id, db_old_id, db_time_minted) = fetch_row_state(pool).await;
+        assert_eq!(db_id, pinged.id);
+        assert_eq!(db_old_id, created.id, "old_id should be the pre-rotation id");
+        assert!(
+            db_time_minted > chrono::Utc::now().naive_utc() - chrono::Duration::seconds(5),
+            "time_minted should have been refreshed on rotation"
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_ping_with_old_id_within_grace_period_succeeds_without_rotating() {
+        let session = AuthSession::new(TestRole::Admin);
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        // Force the first ping to rotate.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET date_created = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(created.id)
+        .execute(pool)
+        .await
+        .expect("backdate session");
+
+        let after_rotation =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+                30,
+                &created.id.to_string(),
+            )
+            .await
+            .expect("ping rotates")
+            .expect("session should exist");
+        assert_ne!(after_rotation.id, created.id);
+
+        // An inflight request still using the original id arrives during the
+        // grace window — should succeed and return the current (rotated) row
+        // without rotating again.
+        let inflight =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+                30,
+                &created.id.to_string(),
+            )
+            .await
+            .expect("inflight ping")
+            .expect("session should still be reachable via old_id");
+
+        assert_eq!(inflight.id, after_rotation.id, "inflight ping must not rotate");
+
+        let (db_id, db_old_id, _) = fetch_row_state(pool).await;
+        assert_eq!(db_id, after_rotation.id);
+        assert_eq!(db_old_id, created.id);
+    }
+
+    #[saps::db_test]
+    async fn test_ping_with_old_id_outside_grace_period_returns_none() {
+        let session = AuthSession::new(TestRole::Customer);
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        // Rotate the session.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET date_created = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(created.id)
+        .execute(pool)
+        .await
+        .expect("backdate before rotation");
+
+        let after_rotation =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+                30,
+                &created.id.to_string(),
+            )
+            .await
+            .expect("ping rotates")
+            .expect("session exists");
+        assert_ne!(after_rotation.id, created.id);
+
+        // Push time_minted past the 10s grace window.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET time_minted = NOW() - INTERVAL '30 seconds' \
+             WHERE id = $1",
+        )
+        .bind(after_rotation.id)
+        .execute(pool)
+        .await
+        .expect("backdate time_minted");
+
+        let result =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+                30,
+                &created.id.to_string(),
+            )
+            .await
+            .expect("ping with stale old_id");
+        assert!(result.is_none(), "grace period must have expired");
+
+        // The row itself is still present and untouched (only the lookup failed).
+        let (db_id, db_old_id, _) = fetch_row_state(pool).await;
+        assert_eq!(db_id, after_rotation.id);
+        assert_eq!(db_old_id, created.id);
+    }
+
+    #[saps::db_test]
+    async fn test_ping_with_old_id_does_not_trigger_second_rotation() {
+        let session = AuthSession::new(TestRole::Admin);
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        // First rotation.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET date_created = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(created.id)
+        .execute(pool)
+        .await
+        .expect("backdate");
+
+        let after_rotation =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+                30,
+                &created.id.to_string(),
+            )
+            .await
+            .expect("rotates")
+            .expect("session exists");
+
+        // Backdate the *new* date_created so that a current-id ping would
+        // rotate again. We then ping with the OLD id and confirm no rotation
+        // happens (grace-period match must not re-rotate).
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET date_created = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(after_rotation.id)
+        .execute(pool)
+        .await
+        .expect("backdate post-rotation");
+
+        let grace_ping =
+            AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+                30,
+                &created.id.to_string(),
+            )
+            .await
+            .expect("ping via old id")
+            .expect("session exists");
+        assert_eq!(
+            grace_ping.id, after_rotation.id,
+            "grace-period ping must not rotate the session again"
+        );
+
+        let (db_id, db_old_id, _) = fetch_row_state(pool).await;
+        assert_eq!(db_id, after_rotation.id);
+        assert_eq!(db_old_id, created.id);
+    }
+
+    #[saps::db_test]
+    async fn test_expired_session_deleted_when_pinged_via_old_id() {
+        let session = AuthSession::new(TestRole::Admin);
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("create session");
+
+        // Rotate first so old_id != id.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET date_created = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(created.id)
+        .execute(pool)
+        .await
+        .expect("backdate");
+
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+            30,
+            &created.id.to_string(),
+        )
+        .await
+        .expect("rotates")
+        .expect("session exists");
+
+        // Now make last_interacted very old so the session is considered expired.
+        saps::sqlx::query(
+            "UPDATE saps.auth_sessions \
+             SET last_interacted = NOW() - INTERVAL '2 hours' \
+             WHERE old_id = $1",
+        )
+        .bind(created.id)
+        .execute(pool)
+        .await
+        .expect("expire session");
+
+        let result = AuthPostGresDescriptor::<TestDbHandle>::ping_auth_session::<TestRole>(
+            30,
+            &created.id.to_string(),
+        )
+        .await
+        .expect("ping expired via old_id");
+        assert!(result.is_none(), "expired session must be evicted");
+
+        let row = saps::sqlx::query("SELECT id FROM saps.auth_sessions")
+            .fetch_optional(pool)
+            .await
+            .expect("fetch");
+        assert!(row.is_none(), "expired session row should be deleted");
+    }
 }

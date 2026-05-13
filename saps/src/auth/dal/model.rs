@@ -204,14 +204,28 @@ CREATE SCHEMA IF NOT EXISTS saps;
 
 CREATE TABLE IF NOT EXISTS saps.auth_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    old_id UUID NOT NULL DEFAULT gen_random_uuid(),
     role VARCHAR(255) NOT NULL,
     date_created TIMESTAMP NOT NULL DEFAULT NOW(),
     last_interacted TIMESTAMP NOT NULL DEFAULT NOW(),
+    time_minted TIMESTAMP NOT NULL DEFAULT NOW(),
     meta JSONB
 );
 
+ALTER TABLE saps.auth_sessions
+    ADD COLUMN IF NOT EXISTS old_id UUID;
+UPDATE saps.auth_sessions SET old_id = id WHERE old_id IS NULL;
+ALTER TABLE saps.auth_sessions ALTER COLUMN old_id SET NOT NULL;
+ALTER TABLE saps.auth_sessions ALTER COLUMN old_id SET DEFAULT gen_random_uuid();
+
+ALTER TABLE saps.auth_sessions
+    ADD COLUMN IF NOT EXISTS time_minted TIMESTAMP NOT NULL DEFAULT NOW();
+
 CREATE INDEX IF NOT EXISTS idx_saps_auth_sessions_last_interacted
     ON saps.auth_sessions (last_interacted);
+
+CREATE INDEX IF NOT EXISTS idx_saps_auth_sessions_old_id
+    ON saps.auth_sessions (old_id);
 
 CREATE OR REPLACE FUNCTION saps.ping(
     p_minutes INTEGER,
@@ -225,7 +239,7 @@ DECLARE
     rows_affected INTEGER;
 BEGIN
     DELETE FROM saps.auth_sessions
-    WHERE id = p_session_id
+    WHERE (id = p_session_id OR old_id = p_session_id)
       AND last_interacted < NOW() - (p_minutes || ' minutes')::INTERVAL;
 
     GET DIAGNOSTICS rows_affected = ROW_COUNT;
@@ -234,32 +248,49 @@ BEGIN
         RETURN NULL;
     END IF;
 
-    -- If date_created is older than 5 minutes, regenerate UUID and reset date_created
-    UPDATE saps.auth_sessions
-    SET id = gen_random_uuid(),
-        date_created = NOW(),
-        last_interacted = NOW()
-    WHERE id = p_session_id
-      AND date_created < NOW() - INTERVAL '5 minutes'
-    RETURNING * INTO session_record;
+    SELECT * INTO session_record
+    FROM saps.auth_sessions
+    WHERE id = p_session_id OR old_id = p_session_id
+    LIMIT 1;
 
-    GET DIAGNOSTICS rows_affected = ROW_COUNT;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
 
-    IF rows_affected > 0 THEN
+    -- Grace period: caller used the previous id of an already-rotated session.
+    -- Accept the ping if rotation happened within the last 10 seconds, but do
+    -- not rotate again and do not refresh time_minted.
+    IF session_record.id <> p_session_id AND session_record.old_id = p_session_id THEN
+        IF session_record.time_minted < NOW() - INTERVAL '10 seconds' THEN
+            RETURN NULL;
+        END IF;
+
+        UPDATE saps.auth_sessions
+        SET last_interacted = NOW()
+        WHERE id = session_record.id
+        RETURNING * INTO session_record;
+
         RETURN session_record;
     END IF;
 
-    -- Otherwise just update last_interacted
+    -- Caller used the current id and the session is old enough to rotate.
+    IF session_record.date_created < NOW() - INTERVAL '5 minutes' THEN
+        UPDATE saps.auth_sessions
+        SET old_id = id,
+            id = gen_random_uuid(),
+            date_created = NOW(),
+            last_interacted = NOW(),
+            time_minted = NOW()
+        WHERE id = p_session_id
+        RETURNING * INTO session_record;
+
+        RETURN session_record;
+    END IF;
+
     UPDATE saps.auth_sessions
     SET last_interacted = NOW()
     WHERE id = p_session_id
     RETURNING * INTO session_record;
-
-    GET DIAGNOSTICS rows_affected = ROW_COUNT;
-
-    IF rows_affected = 0 THEN
-        RETURN NULL;
-    END IF;
 
     RETURN session_record;
 END;

@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "saps"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "axum",
  "base64",
