@@ -70,6 +70,7 @@
 //! ```
 use crate::{
     auth::{
+        auth_trace,
         dal::{
             model::AuthSession,
             tx_definitions::{
@@ -721,9 +722,17 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     pub fn encode(self) -> Result<String, SapsError> {
         let key_str = X::get_config_variable("SECRET_KEY".to_string())?;
         let key = EncodingKey::from_secret(key_str.as_ref());
+        auth_trace!(
+            session_id = %self.unique_id,
+            time_expire = %self.time_expire,
+            "encoding JWT",
+        );
         match encode(&Header::default(), &self, &key) {
             Ok(token) => Ok(token),
-            Err(error) => Err(SapsError::unauthorized(error.to_string())),
+            Err(error) => {
+                auth_trace!(error = %error, "JWT encode failed");
+                Err(SapsError::unauthorized(error.to_string()))
+            }
         }
     }
 
@@ -750,8 +759,18 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
         validation.required_spec_claims.remove("exp");
 
         match decode::<Self>(token, &key, &validation) {
-            Ok(token_data) => Ok(token_data.claims),
-            Err(error) => Err(SapsError::unauthorized(error.to_string())),
+            Ok(token_data) => {
+                auth_trace!(
+                    session_id = %token_data.claims.unique_id,
+                    time_expire = %token_data.claims.time_expire,
+                    "decoded JWT",
+                );
+                Ok(token_data.claims)
+            }
+            Err(error) => {
+                auth_trace!(error = %error, "JWT decode failed");
+                Err(SapsError::unauthorized(error.to_string()))
+            }
         }
     }
 
@@ -946,20 +965,93 @@ where
     /// a [`SapsError`] rejection.
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let headers = &parts.headers;
+        // Snapshot identifying request info up front so every trace from this
+        // extractor carries the same context. method+uri stay relevant even
+        // once we have a session_id and continue to be useful when we don't
+        // (e.g. cookie lookup misses, ping returns nothing, decode fails).
+        #[cfg(feature = "auth-tracing")]
+        let method = parts.method.clone();
+        #[cfg(feature = "auth-tracing")]
+        let uri = parts.uri.clone();
+        auth_trace!(
+            method = %method,
+            uri = %uri,
+            "from_request_parts — auth flow start",
+        );
 
         // Try cookie first, then the `token` header, then bearer as a fallback.
         let raw_token = match Self::extract_token_from_cookies(headers)? {
-            Some(token) => token,
-            None => match Self::extract_token_from_header(headers)? {
-                Some(token) => token,
-                None => Self::extract_bearer_token(headers)?,
-            },
+            Some(token) => {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    source = "cookie",
+                    "from_request_parts — JWT located",
+                );
+                token
+            }
+            None => {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    "from_request_parts — no `saps-token` cookie, trying `token` header",
+                );
+                match Self::extract_token_from_header(headers)? {
+                    Some(token) => {
+                        auth_trace!(
+                            method = %method,
+                            uri = %uri,
+                            source = "token-header",
+                            "from_request_parts — JWT located",
+                        );
+                        token
+                    }
+                    None => {
+                        auth_trace!(
+                            method = %method,
+                            uri = %uri,
+                            "from_request_parts — no `token` header, falling back to bearer",
+                        );
+                        let token = Self::extract_bearer_token(headers).map_err(|e| {
+                            auth_trace!(
+                                method = %method,
+                                uri = %uri,
+                                error = %e.message,
+                                "from_request_parts — no JWT found in any supported location",
+                            );
+                            e
+                        })?;
+                        auth_trace!(
+                            method = %method,
+                            uri = %uri,
+                            source = "bearer",
+                            "from_request_parts — JWT located",
+                        );
+                        token
+                    }
+                }
+            }
         };
 
         // Decode the JWT and verify the signature.
-        let token = Self::decode(&raw_token)?;
+        let token = Self::decode(&raw_token).map_err(|e| {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                error = %e.message,
+                "from_request_parts — JWT decode failed",
+            );
+            e
+        })?;
 
         let existing_id = token.unique_id.clone();
+        auth_trace!(
+            method = %method,
+            uri = %uri,
+            session_id = %existing_id,
+            time_expire = %token.time_expire,
+            "from_request_parts — JWT decoded, pinging session",
+        );
 
         // Ping the session to keep it alive and check if it still exists.
         // Sessions inactive for more than 10 minutes are deleted by the stored procedure.
@@ -967,14 +1059,61 @@ where
             10,
             &token.unique_id,
         )
-        .await?
+        .await
+        .map_err(|e| {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %existing_id,
+                error = %e,
+                "from_request_parts — ping_auth_session DB call failed",
+            );
+            e
+        })?
         {
             Some(session) => session,
-            None => return Err(SapsError::unauthorized("session not present")),
+            None => {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    session_id = %existing_id,
+                    "from_request_parts — session not present in DB (expired or never existed)",
+                );
+                return Err(SapsError::unauthorized("session not present"));
+            }
         };
 
+        auth_trace!(
+            method = %method,
+            uri = %uri,
+            session_id = %existing_id,
+            returned_session_id = %session.id,
+            role = %session.role.to_string(),
+            date_created = %session.date_created,
+            last_interacted = %session.last_interacted,
+            meta = ?session.meta,
+            "from_request_parts — ping returned session",
+        );
+
         // Verify the session's role satisfies the check strategy Y.
-        Y::check_user_role(&session.role)?;
+        Y::check_user_role(&session.role).map_err(|e| {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %existing_id,
+                role = %session.role.to_string(),
+                error = %e.message,
+                "from_request_parts — role check FAILED",
+            );
+            e
+        })?;
+        auth_trace!(
+            method = %method,
+            uri = %uri,
+            session_id = %existing_id,
+            role = %session.role.to_string(),
+            "from_request_parts — role check passed",
+        );
 
         let mut token = token;
 
@@ -984,19 +1123,72 @@ where
         // interior mutability is what lets the layer (which already moved the
         // request into next.run) observe the value after the handler returns.
         if session.id.to_string() != existing_id {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %existing_id,
+                new_session_id = %session.id,
+                "from_request_parts — ROTATION detected, refreshing JWT and cookie",
+            );
             token.unique_id = session.id.to_string();
+            // Refresh the JWT expiry on rotation. Without this, the rotated
+            // token carries the original login's `time_expire` through every
+            // refresh, so any future caller of `check_if_expired` would see a
+            // healthy session as expired the moment the original login window
+            // elapses (e.g. 20 minutes after first sign-in, even though the
+            // user has been active and their session has been rotating
+            // happily the whole time).
+            let token_expire_mins = X::get_config_variable("TOKEN_EXPIRE_MINS".into())?
+                .parse::<i64>()
+                .map_err(|e| SapsError::unknown(e.to_string()))?;
+            token.time_expire = Utc::now() + chrono::Duration::minutes(token_expire_mins);
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %session.id,
+                time_expire = %token.time_expire,
+                token_expire_mins = token_expire_mins,
+                "from_request_parts — new time_expire applied to rotated token",
+            );
             let new_jwt = token.encode()?;
             let cookie_str = AuthTokenCookie::from(&new_jwt).yield_cookie_string();
             if let Some(slot) = parts.extensions.get::<CookieSlot>() {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    session_id = %session.id,
+                    "from_request_parts — handing refreshed cookie to CookieSlot",
+                );
                 slot.set(UpdatedAuthCookie(cookie_str));
+            } else {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    session_id = %session.id,
+                    "from_request_parts — no CookieSlot in extensions; client will NOT receive new cookie (is `attach_refreshed_cookie` layer installed?)",
+                );
             }
             // re-decode the token so we return a valid struct (encode consumes self).
             // Decoded tokens have `old_uuid = None` (it's #[serde(skip)]), so we
             // re-apply the rotation marker after decoding.
             token = Self::decode(&new_jwt)?;
             token.old_uuid = Some(existing_id);
+        } else {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %existing_id,
+                "from_request_parts — no rotation, session UUID unchanged",
+            );
         }
         token.auth_session = Some(session);
+        auth_trace!(
+            method = %method,
+            uri = %uri,
+            session_id = %token.unique_id,
+            rotated = token.old_uuid.is_some(),
+            "from_request_parts — auth flow complete",
+        );
         Ok(token)
     }
 }

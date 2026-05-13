@@ -9,6 +9,7 @@ This framework combines `Svelte`, `Axum`, `Postgres`, and `sqlx` with helpful ma
 - [Auth](#auth)
 - [Embedding and serving a frontend](#embedding-and-serving-a-frontend)
 - [Background Tasks](#background-tasks)
+- [Roadmap](#roadmap)
 
 ## DB Transactions
 
@@ -394,6 +395,63 @@ let app = Router::new()
 ```
 
 The layer installs a slot in the request extensions, the extractor writes the new cookie into that slot when a rotation happens, and the layer attaches the `Set-Cookie` to the response after the handler returns. It's a no-op when no rotation occurred, so it's safe to apply broadly — even on routes that don't use `HeaderToken`.
+
+### Debug tracing
+
+The auth flow is silent by default. When something is misbehaving — users being kicked out unexpectedly, cookie rotations not reaching the client, role checks failing for the wrong reason — turn on the `auth-tracing` Cargo feature to get a `trace!`-level event at every meaningful step of `HeaderToken::from_request_parts` and `attach_refreshed_cookie`.
+
+> [!WARNING]
+> `auth-tracing` is expensive. Every authenticated request emits ~6–10 trace events, each carrying request and session fields, and the rotation/meta paths include the full session row (including the `meta` JSONB). Only enable it for debugging — never leave it on in production.
+
+Enable it in your application's `Cargo.toml`:
+
+```toml
+[dependencies]
+saps = { version = "0.3", features = ["auth-tracing"] }
+```
+
+Install a `tracing` subscriber in `main` and filter to the `saps::auth` target so you don't have to wade through unrelated logs:
+
+```rust
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("saps::auth=trace")),
+        )
+        .init();
+
+    // … axum app setup …
+}
+```
+
+Or set it via the environment without code changes:
+
+```bash
+RUST_LOG="saps::auth=trace" cargo run
+```
+
+Every event from the auth flow carries `method` and `uri`; everything past the JWT decode also carries `session_id`; rotations additionally carry `new_session_id`. A typical request that triggers a rotation looks like this:
+
+```text
+TRACE saps::auth: attach_refreshed_cookie — installing CookieSlot method=POST uri=/api/v1/me
+TRACE saps::auth: from_request_parts — auth flow start method=POST uri=/api/v1/me
+TRACE saps::auth: from_request_parts — JWT located method=POST uri=/api/v1/me source=cookie
+TRACE saps::auth: decoded JWT session_id=8b1e… time_expire=2026-05-13T12:54:56Z
+TRACE saps::auth: from_request_parts — JWT decoded, pinging session method=POST uri=/api/v1/me session_id=8b1e… time_expire=2026-05-13T12:54:56Z
+TRACE saps::auth: from_request_parts — ping returned session method=POST uri=/api/v1/me session_id=8b1e… returned_session_id=4f2a… role=admin date_created=2026-05-13T12:29:11Z last_interacted=2026-05-13T12:34:55Z meta=Some(Object {"user_id": Number(42)})
+TRACE saps::auth: from_request_parts — role check passed method=POST uri=/api/v1/me session_id=8b1e… role=admin
+TRACE saps::auth: from_request_parts — ROTATION detected, refreshing JWT and cookie method=POST uri=/api/v1/me session_id=8b1e… new_session_id=4f2a…
+TRACE saps::auth: encoding JWT session_id=4f2a… time_expire=2026-05-13T12:54:56Z
+TRACE saps::auth: from_request_parts — handing refreshed cookie to CookieSlot method=POST uri=/api/v1/me session_id=4f2a…
+TRACE saps::auth: from_request_parts — auth flow complete method=POST uri=/api/v1/me session_id=4f2a… rotated=true
+TRACE saps::auth: attach_refreshed_cookie — attaching Set-Cookie (rotation occurred) method=POST uri=/api/v1/me cookie=saps-token=…; HttpOnly; Path=/; Max-Age=… status=200 OK
+```
+
+Failure paths emit the same shape with an `error` field — `JWT decode failed`, `session not present in DB`, `role check FAILED`, `ping_auth_session DB call failed`. The rotation path also emits a loud warning when no `CookieSlot` is installed in the request extensions (`client will NOT receive new cookie`) — that's the giveaway that the [`attach_refreshed_cookie`](#middleware) layer isn't mounted on a route that needs it.
 
 ### Role checks
 
@@ -1192,3 +1250,15 @@ let outcome = add::<LivePostGresPool>(1, 2).await;
 ```
 
 Note that the `::<LivePostGresPool>` was added to the `add` function. This is because we need a handle to access the db pool. Remember, because it has the DB pool handle these background tasks can be involved in `#[db_test]` tests.
+
+
+## Roadmap
+
+The following are on the list to land in saps. Each one will follow the same conventions as the existing modules — handles passed in as generics, `#[db_test]` integration tests, and minimal runtime surface so application code stays thin.
+
+- **Email sending** — a transport-agnostic interface (SMTP / SES / Mailgun / Resend behind one trait) with a queued path that piggybacks on the background-tasks runtime so retries and rate limits are persisted in postgres rather than in memory.
+- **Payment processing** — Stripe-first integration covering checkout sessions, webhooks (with idempotency keyed off the event id), and a customer/subscription model that lives in your DAL but is migrated by saps.
+- **OAuth providers** — Google, GitHub, LinkedIn, Microsoft, and Apple. Each provider plugs into the existing auth/session pipeline: the OAuth dance normalizes provider claims into a saps-managed external identity record, writes selected claims into session meta, and returns the same session/token shape consumed by HeaderToken.
+- **Single-user tokens** — short-lived, single-use tokens for password reset, email verification, magic-link login, and other one-shot flows. Backed by a saps-managed table with TTL + atomic consume-on-use semantics so a token can never be exchanged twice.
+- **File storage** — files (bytes + metadata: owner, size, content-type, expiry) stored as rows in postgres so a single transaction commits both, and so the existing `#[db_test]` machinery gives every test an isolated file store for free. The whole thing sits behind a trait, so a local-disk backend (bytes on the filesystem, metadata still in postgres) is drop-in interchangeable for cases where blobs are large enough that you'd rather not hold them in the DB — your handler code is unchanged either way. Also be interchangable with `s3`, `R2`, or streaming large object storage in postgres.
+- **Admin Panel** - Integration with DB transaction traits to support an admin panel.

@@ -39,6 +39,7 @@
 //! The layer is a no-op for requests where no rotation occurred, so it is safe
 //! to apply broadly — even on routes that don't use `HeaderToken` at all.
 
+use crate::auth::auth_trace;
 use crate::auth::token::header_token::UpdatedAuthCookie;
 use axum::{extract::Request, http::header, middleware::Next, response::Response};
 use std::sync::{Arc, Mutex};
@@ -62,6 +63,11 @@ impl CookieSlot {
     pub fn set(&self, cookie: UpdatedAuthCookie) {
         if let Ok(mut guard) = self.0.lock() {
             *guard = Some(cookie);
+        } else {
+            // No request context available here — the caller in
+            // `from_request_parts` already logs the rotation with session_id
+            // before this point, so a session_id-less warning is sufficient.
+            auth_trace!("CookieSlot::set — mutex poisoned, dropping cookie");
         }
     }
 
@@ -86,14 +92,50 @@ impl CookieSlot {
 /// returned unchanged rather than failing the request.
 pub async fn attach_refreshed_cookie(mut req: Request, next: Next) -> Response {
     let slot = CookieSlot::default();
+    // Capture method+uri up-front so every trace from this layer carries the
+    // same identifying context, even after `req` is consumed by `next.run`.
+    #[cfg(feature = "auth-tracing")]
+    let method = req.method().clone();
+    #[cfg(feature = "auth-tracing")]
+    let uri = req.uri().clone();
+    auth_trace!(
+        method = %method,
+        uri = %uri,
+        "attach_refreshed_cookie — installing CookieSlot",
+    );
     req.extensions_mut().insert(slot.clone());
 
     let mut response = next.run(req).await;
 
-    if let Some(UpdatedAuthCookie(cookie)) = slot.take()
-        && let Ok(value) = cookie.parse()
-    {
-        response.headers_mut().insert(header::SET_COOKIE, value);
+    match slot.take() {
+        Some(UpdatedAuthCookie(cookie)) => match cookie.parse() {
+            Ok(value) => {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    cookie = %cookie,
+                    status = %response.status(),
+                    "attach_refreshed_cookie — attaching Set-Cookie (rotation occurred)",
+                );
+                response.headers_mut().insert(header::SET_COOKIE, value);
+            }
+            Err(_) => {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    cookie = %cookie,
+                    "attach_refreshed_cookie — refreshed cookie failed to parse as HeaderValue, leaving response unchanged",
+                );
+            }
+        },
+        None => {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                status = %response.status(),
+                "attach_refreshed_cookie — no rotation, response unchanged",
+            );
+        }
     }
     response
 }

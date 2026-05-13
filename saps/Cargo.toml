@@ -1,6 +1,6 @@
 [package]
 name = "saps"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 description = "Core library for the SAP framework"
 license = "MIT"
@@ -56,6 +56,7 @@ server = [
     "dep:saps-frontend-macro",
     "dep:saps-background-task",
 ]
+auth-tracing = []
 
 [dev-dependencies]
 http-body-util = { workspace = true }
