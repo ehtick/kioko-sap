@@ -1138,7 +1138,7 @@ The persistence of background tasks is handled in a non-public schema in postgre
 >
 > ```toml
 > [dependencies]
-> ctor = "0.10"
+> ctor = "1.0.6"
 > ```
 
 First, we need the following imports:

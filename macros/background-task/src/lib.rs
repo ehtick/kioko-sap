@@ -58,7 +58,7 @@ pub fn background_task(_attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(result)
         }
 
-        #[ctor::ctor]
+        #[ctor::ctor(unsafe)]
         fn #register_ident () {
             saps::background_tasks::registry::TASK_REGISTRY
                 .write()

@@ -1,6 +1,6 @@
 [package]
 name = "saps-background-task"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Procedural macro for defining background task functions"
 license = "MIT"
