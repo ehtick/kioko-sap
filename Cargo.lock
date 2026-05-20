@@ -1746,7 +1746,7 @@ dependencies = [
  "paste",
  "rmp-serde",
  "rust-embed",
- "saps-background-task 0.1.0",
+ "saps-background-task 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-pool-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-tx 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-frontend-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1763,9 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "saps-background-task"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57600dfb9fbe71b74b58c7c441e45b34d12c18864b8217a14b1bfb543ed41e50"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1775,6 +1773,8 @@ dependencies = [
 [[package]]
 name = "saps-background-task"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2298799e8ae2bc82c96b967543982650dd1f149f7a0a5394de0b67623bda007"
 dependencies = [
  "proc-macro2",
  "quote",
