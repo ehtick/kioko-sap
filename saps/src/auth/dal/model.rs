@@ -343,6 +343,62 @@ $$;
         )
     }
 
+    /// Returns SQL that creates a partial unique index enforcing that no two
+    /// sessions share the same `(meta->>key1, meta->>key2)` pair.
+    ///
+    /// Use this when uniqueness needs to be scoped to a combination of two
+    /// meta keys rather than a single value — e.g. `("user_id", "server_tag")`
+    /// so the same user can hold one active session per server (app server,
+    /// metrics server, etc.) without colliding with their session on a
+    /// different server. Sessions missing either key are excluded by the
+    /// partial `WHERE meta ? key1 AND meta ? key2` clause and never collide.
+    ///
+    /// The index name is `idx_saps_auth_sessions_meta_<key1>_<key2>` with
+    /// non-alnum characters in each key stripped, so two key pairs that
+    /// differ only in punctuation would collide. Pass simple alphanumeric
+    /// keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either key is empty or contains a single quote (which would
+    /// break the embedded SQL string literal).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Allow one session per (user_id, server_tag) pair
+    /// sqlx::raw_sql(&AuthSession::<MyRole>::generate_unique_meta_key_pair_sql(
+    ///     "user_id", "server_tag",
+    /// ))
+    /// .execute(&pool).await?;
+    /// ```
+    pub fn generate_unique_meta_key_pair_sql(key1: &str, key2: &str) -> String {
+        assert!(!key1.is_empty(), "first meta key must not be empty");
+        assert!(!key2.is_empty(), "second meta key must not be empty");
+        assert!(
+            !key1.contains('\''),
+            "first meta key must not contain single quotes: {:?}",
+            key1
+        );
+        assert!(
+            !key2.contains('\''),
+            "second meta key must not contain single quotes: {:?}",
+            key2
+        );
+        let safe = |k: &str| -> String {
+            k.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        };
+        let safe1 = safe(key1);
+        let safe2 = safe(key2);
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_saps_auth_sessions_meta_{safe1}_{safe2} \
+             ON saps.auth_sessions ((meta->>'{key1}'), (meta->>'{key2}')) \
+             WHERE meta ? '{key1}' AND meta ? '{key2}';\n",
+        )
+    }
+
     /// Runs the auth session migration against the pool exposed by `Y`.
     ///
     /// Executes [`generate_migration_sql`](Self::generate_migration_sql) and
@@ -953,6 +1009,168 @@ mod tests {
             .await
             .expect("get all");
         assert_eq!(all.len(), 2);
+    }
+
+    #[saps::db_test]
+    async fn test_unique_meta_key_pair_blocks_duplicate_pair() {
+        AuthSession::<TestRole>::run_migration::<TestDbHandle>(&[])
+            .await
+            .expect("install migration");
+        let sql = AuthSession::<TestRole>::generate_unique_meta_key_pair_sql(
+            "user_id",
+            "server_tag",
+        );
+        saps::sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .expect("install unique pair index");
+
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("first insert should succeed");
+
+        let dup = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await;
+        let err = dup.expect_err("duplicate (user_id, server_tag) pair must fail");
+        let db_err = match err {
+            sqlx::Error::Database(db_err) => db_err,
+            other => panic!("expected database error, got {:?}", other),
+        };
+        assert!(
+            db_err.is_unique_violation(),
+            "expected unique violation, got: {}",
+            db_err
+        );
+
+        // Same user on a different server — pair is distinct, so allowed.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("user_id=1 on a different server_tag should succeed");
+
+        // Two rows with only user_id and no server_tag — partial index excludes them.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("user_id=1 without server_tag should succeed");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("second user_id=1 without server_tag should still succeed");
+
+        // Different user on a different server — fully distinct pair.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 2, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("user_id=2 on a different server_tag should succeed");
+
+        // Multiple rows with only server_tag and no user_id — partial index excludes them.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"server_tag": "app"})),
+        )
+        .await
+        .expect("server_tag=app without user_id should succeed");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"server_tag": "app"})),
+        )
+        .await
+        .expect("second server_tag=app without user_id should still succeed");
+    }
+
+    #[saps::db_test]
+    async fn test_unique_meta_key_pair_allows_same_user_different_server() {
+        AuthSession::<TestRole>::run_migration::<TestDbHandle>(&[])
+            .await
+            .expect("install migration");
+        let sql = AuthSession::<TestRole>::generate_unique_meta_key_pair_sql(
+            "user_id",
+            "server_tag",
+        );
+        saps::sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .expect("install unique pair index");
+
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("first insert");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("same user on a different server should be allowed");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 2, "server_tag": "app"})),
+        )
+        .await
+        .expect("different user on same server should be allowed");
+
+        let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+            .await
+            .expect("get all");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[saps::db_test]
+    async fn test_unique_meta_key_pair_skips_when_either_key_missing() {
+        AuthSession::<TestRole>::run_migration::<TestDbHandle>(&[])
+            .await
+            .expect("install migration");
+        let sql = AuthSession::<TestRole>::generate_unique_meta_key_pair_sql(
+            "user_id",
+            "server_tag",
+        );
+        saps::sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .expect("install unique pair index");
+
+        // No meta at all — excluded.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(AuthSession::new(
+            TestRole::Admin,
+        ))
+        .await
+        .expect("insert without meta");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(AuthSession::new(
+            TestRole::Customer,
+        ))
+        .await
+        .expect("second insert without meta");
+
+        // Only one of the two keys present — excluded.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("insert with only user_id");
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("duplicate user_id without server_tag should still be allowed");
+
+        let all = AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+            .await
+            .expect("get all");
+        assert_eq!(all.len(), 4);
     }
 
     #[saps::db_test]

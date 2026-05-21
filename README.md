@@ -381,6 +381,31 @@ AuthSession::<MyRole>::run_migration::<LivePostGresPool>(&["user_id"]).await?;
 
 A duplicate insert against a covered key fails with `sqlx::Error::Database` whose `is_unique_violation()` is `true`.
 
+### Enforcing uniqueness on a meta key pair
+
+A single-key index forces one session per `user_id` *globally*. If the same user needs an active session on more than one server (e.g. an app server and a metrics server), scope uniqueness to a pair of meta keys — typically `user_id` plus a `server_tag`:
+
+```rust
+use saps::auth::dal::model::AuthSession;
+use saps::dal::connections::{LivePostGresPool, YieldPostGresPool};
+
+// Base schema first — pass &[] if you don't also want a single-key index.
+AuthSession::<MyRole>::run_migration::<LivePostGresPool>(&[]).await?;
+
+// Composite partial unique index over (meta->>'user_id', meta->>'server_tag').
+// Sessions missing either key are excluded from the index, so they never
+// collide with one another.
+let sql = AuthSession::<MyRole>::generate_unique_meta_key_pair_sql(
+    "user_id",
+    "server_tag",
+);
+sqlx::raw_sql(&sql)
+    .execute(LivePostGresPool::yield_pool())
+    .await?;
+```
+
+With this index in place, `(user_id=1, server_tag="app")` and `(user_id=1, server_tag="metrics")` can coexist, but a second `(user_id=1, server_tag="app")` insert fails with a unique violation in the same way as the single-key case.
+
 ### Middleware
 
 When `saps.ping` rotates the session UUID, the extractor needs to send the new `saps-token` cookie back to the client. Apply [`attach_refreshed_cookie`](saps/src/auth/middleware/mod.rs) at the router level so this happens transparently:
