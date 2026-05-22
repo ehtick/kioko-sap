@@ -452,9 +452,11 @@ mod tests {
     use super::*;
     use crate::auth::dal::tx_definitions::{
         CreateAuthSession, DeleteAuthSession, DeleteAuthSessionMetaKey,
-        DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession, GetAuthSessionByMetaKey,
+        DeleteAuthSessionsByMetaKey, DeleteAuthSessionsByMetaKeyPair, GetAllAuthSessions,
+        GetAuthSession, GetAuthSessionByMetaKey,
         GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict, GetAuthSessionsByMetaKey,
-        PingAuthSession, UpsertAuthSessionMetaKey, UpsertAuthSessionsMetaKeyByMeta,
+        GetAuthSessionsByMetaKeyPair, PingAuthSession, UpsertAuthSessionMetaKey,
+        UpsertAuthSessionsMetaKeyByMeta,
     };
     use crate::errors::saps::SapsErrorStatus;
     use crate::dal::connections::AuthPostGresDescriptor;
@@ -902,6 +904,89 @@ mod tests {
     }
 
     #[saps::db_test]
+    async fn test_get_auth_sessions_by_meta_key_pair_filters_to_pair() {
+        let target = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create target");
+        // Same user, different server — must NOT match the pair lookup.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("create other server");
+        // Different user, same server — must NOT match either.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 2, "server_tag": "app"})),
+        )
+        .await
+        .expect("create other user");
+        // Only one of the two keys present — must NOT match.
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create with only user_id");
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key_pair::<TestRole>(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("app"),
+            )
+            .await
+            .expect("get by meta key pair");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, target.id);
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_sessions_by_meta_key_pair_no_match_returns_empty() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create");
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key_pair::<TestRole>(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("metrics"),
+            )
+            .await
+            .expect("get by meta key pair");
+        assert!(matches.is_empty());
+    }
+
+    #[saps::db_test]
+    async fn test_get_auth_sessions_by_meta_key_pair_ignores_null_meta() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(AuthSession::new(
+            TestRole::Admin,
+        ))
+        .await
+        .expect("create without meta");
+
+        let matches =
+            AuthPostGresDescriptor::<TestDbHandle>::get_auth_sessions_by_meta_key_pair::<TestRole>(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("app"),
+            )
+            .await
+            .expect("get by meta key pair");
+        assert!(matches.is_empty());
+    }
+
+    #[saps::db_test]
     async fn test_delete_auth_sessions_by_meta_key() {
         let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
             AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
@@ -934,6 +1019,84 @@ mod tests {
                 .expect("get all");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, survivor.id);
+    }
+
+    #[saps::db_test]
+    async fn test_delete_auth_sessions_by_meta_key_pair_only_deletes_full_pair() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create target");
+        // Same user, different server — must survive.
+        let other_server = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("create other server");
+        // Different user, same server — must survive.
+        let other_user = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 2, "server_tag": "app"})),
+        )
+        .await
+        .expect("create other user");
+        // Only one of the two keys present — must survive.
+        let partial = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(serde_json::json!({"user_id": 1})),
+        )
+        .await
+        .expect("create with only user_id");
+
+        let deleted =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_sessions_by_meta_key_pair(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("app"),
+            )
+            .await
+            .expect("delete by meta key pair");
+        assert_eq!(deleted, 1);
+
+        let remaining =
+            AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+                .await
+                .expect("get all");
+        let ids: Vec<_> = remaining.iter().map(|s| s.id).collect();
+        assert_eq!(remaining.len(), 3);
+        assert!(ids.contains(&other_server.id));
+        assert!(ids.contains(&other_user.id));
+        assert!(ids.contains(&partial.id));
+    }
+
+    #[saps::db_test]
+    async fn test_delete_auth_sessions_by_meta_key_pair_no_matches() {
+        let _ = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create");
+
+        let deleted =
+            AuthPostGresDescriptor::<TestDbHandle>::delete_auth_sessions_by_meta_key_pair(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("metrics"),
+            )
+            .await
+            .expect("delete by meta key pair");
+        assert_eq!(deleted, 0);
+
+        let remaining =
+            AuthPostGresDescriptor::<TestDbHandle>::get_all_auth_sessions::<TestRole>()
+                .await
+                .expect("get all");
+        assert_eq!(remaining.len(), 1);
     }
 
     #[saps::db_test]

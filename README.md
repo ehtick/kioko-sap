@@ -406,6 +406,73 @@ sqlx::raw_sql(&sql)
 
 With this index in place, `(user_id=1, server_tag="app")` and `(user_id=1, server_tag="metrics")` can coexist, but a second `(user_id=1, server_tag="app")` insert fails with a unique violation in the same way as the single-key case.
 
+### Looking up sessions by meta
+
+The session UUID is the primary lookup key, but you often have a domain identifier (`user_id`, an external service id, etc.) in `meta` and want to find the session that way. Every meta-key query uses the JSONB containment operator `@>`, so a single GIN index on `meta` accelerates all of them.
+
+```rust
+use saps::auth::dal::tx_definitions::{
+    GetAuthSessionByMetaKey, GetAuthSessionByMetaKeyStrict, GetAuthSessionsByMetaKey,
+    GetAuthSessionsByMetaKeyPair,
+};
+use saps::dal::connections::{AuthPostGresDescriptor, LivePostGresPool};
+
+// All sessions matching one meta key/value — no uniqueness assumed.
+let sessions = AuthPostGresDescriptor::<LivePostGresPool>
+    ::get_auth_sessions_by_meta_key::<MyRole>("user_id", serde_json::json!(42))
+    .await?;
+
+// At most one session — pair with the single-key partial unique index from
+// generate_unique_meta_key_sql so this is guaranteed to be the unique row.
+let session = AuthPostGresDescriptor::<LivePostGresPool>
+    ::get_auth_session_by_meta_key::<MyRole>("user_id", serde_json::json!(42))
+    .await?;
+
+// Strict variant — returns sqlx::Error::RowNotFound instead of Ok(None) when
+// no session matches. Useful when the caller knows the session must exist.
+let session = AuthPostGresDescriptor::<LivePostGresPool>
+    ::get_auth_session_by_meta_key_strict::<MyRole>("user_id", serde_json::json!(42))
+    .await?;
+
+// Composite lookup — typically used with the generate_unique_meta_key_pair_sql
+// index so this returns one row, but the API is Vec because the query stays
+// correct without the index.
+let sessions = AuthPostGresDescriptor::<LivePostGresPool>
+    ::get_auth_sessions_by_meta_key_pair::<MyRole>(
+        "user_id", serde_json::json!(42),
+        "server_tag", serde_json::json!("app"),
+    )
+    .await?;
+```
+
+Sessions whose `meta` is `NULL` or whose `meta` is missing any of the queried keys never match — `@>` is strict containment, so a row with `{"user_id": 42}` does not match a lookup for `("user_id", 42, "server_tag", "app")`.
+
+### Deleting sessions by meta
+
+Useful for logging a user out everywhere (single key) or out of one specific server (pair). Both return the number of rows removed.
+
+```rust
+use saps::auth::dal::tx_definitions::{
+    DeleteAuthSessionsByMetaKey, DeleteAuthSessionsByMetaKeyPair,
+};
+use saps::dal::connections::{AuthPostGresDescriptor, LivePostGresPool};
+
+// Force-logout: drop every session for this user, regardless of server.
+let removed = AuthPostGresDescriptor::<LivePostGresPool>
+    ::delete_auth_sessions_by_meta_key("user_id", serde_json::json!(42))
+    .await?;
+
+// Logout from one server only — leaves the user's other server sessions in place.
+let removed = AuthPostGresDescriptor::<LivePostGresPool>
+    ::delete_auth_sessions_by_meta_key_pair(
+        "user_id", serde_json::json!(42),
+        "server_tag", serde_json::json!("app"),
+    )
+    .await?;
+```
+
+Same containment semantics as the lookups — a row matches only when `meta` contains every key/value pair you pass, so rows missing one of the keys (or with a different value for one of them) are left untouched.
+
 ### Middleware
 
 When `saps.ping` rotates the session UUID, the extractor needs to send the new `saps-token` cookie back to the client. Apply [`attach_refreshed_cookie`](saps/src/auth/middleware/mod.rs) at the router level so this happens transparently:

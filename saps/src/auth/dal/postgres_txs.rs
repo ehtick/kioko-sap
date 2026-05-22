@@ -48,9 +48,11 @@ use super::{
     model::AuthSession,
     tx_definitions::{
         CompareAndSwapAuthSessionMeta, CreateAuthSession, DeleteAuthSession,
-        DeleteAuthSessionMetaKey, DeleteAuthSessionsByMetaKey, GetAllAuthSessions, GetAuthSession,
+        DeleteAuthSessionMetaKey, DeleteAuthSessionsByMetaKey, DeleteAuthSessionsByMetaKeyPair,
+        GetAllAuthSessions, GetAuthSession,
         GetAuthSessionByMetaKey, GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict,
-        GetAuthSessionsByMetaKey, PingAuthSession, UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
+        GetAuthSessionsByMetaKey, GetAuthSessionsByMetaKeyPair, PingAuthSession,
+        UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
         UpsertAuthSessionsMetaKeyByMeta,
     },
 };
@@ -546,6 +548,58 @@ async fn get_auth_session_by_meta_key_strict<U: UserRole>(
     AuthSession::from_row(&row).map_err(|e| sqlx::Error::Protocol(e.message))
 }
 
+/// Returns every auth session whose `meta` contains both `(key1, value1)` and
+/// `(key2, value2)`.
+///
+/// Designed to be paired with the composite partial unique index from
+/// [`AuthSession::generate_unique_meta_key_pair_sql`](super::model::AuthSession::generate_unique_meta_key_pair_sql),
+/// where the index guarantees the result is at most one row — e.g. looking up
+/// a session by `("user_id", N, "server_tag", "app")`. The query stays correct
+/// without the index; it just degenerates to "all matching rows" in that case,
+/// which is why the return type is `Vec<AuthSession<U>>` rather than `Option`.
+///
+/// Uses the JSONB containment operator `@>` so the same GIN index that
+/// accelerates [`get_auth_sessions_by_meta_key`] also accelerates this query
+/// if one is installed.
+///
+/// # Arguments
+///
+/// * `key1` - The first top-level key to look for in `meta`.
+/// * `value1` - The JSON value the first key must equal.
+/// * `key2` - The second top-level key to look for in `meta`.
+/// * `value2` - The JSON value the second key must equal.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if:
+/// - The query fails
+/// - Any row's `role` string cannot be parsed back into `U`
+#[db_transaction(AuthPostGresDescriptor, GetAuthSessionsByMetaKeyPair)]
+async fn get_auth_sessions_by_meta_key_pair<U: UserRole>(
+    key1: &str,
+    value1: Value,
+    key2: &str,
+    value2: Value,
+) -> Vec<AuthSession<U>> {
+    let pool = T::yield_pool();
+    let rows = sqlx::query(
+        "SELECT id, role, date_created, last_interacted, meta \
+         FROM saps.auth_sessions \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb, $3::text, $4::jsonb)",
+    )
+        .bind(key1)
+        .bind(value1)
+        .bind(key2)
+        .bind(value2)
+        .fetch_all(pool)
+        .await?;
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        sessions.push(AuthSession::from_row(row).map_err(|e| sqlx::Error::Protocol(e.message))?);
+    }
+    Ok(sessions)
+}
+
 /// Sets `upsert_key`/`upsert_value` on every session whose `meta` matches
 /// `match_key`/`match_value`, returning the number of rows that were updated.
 ///
@@ -616,6 +670,51 @@ async fn delete_auth_sessions_by_meta_key(key: &str, value: Value) -> u64 {
     )
         .bind(key)
         .bind(value)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes every auth session whose `meta` contains both `(key1, value1)` and
+/// `(key2, value2)`.
+///
+/// Pair-scoped counterpart of [`delete_auth_sessions_by_meta_key`] — uses the
+/// JSONB containment operator `@>` to match rows whose `meta` includes both
+/// key/value pairs, leaving rows that match only one (or neither) untouched.
+/// Designed to target the same sessions that
+/// [`get_auth_sessions_by_meta_key_pair`] returns, i.e. one specific
+/// `(user_id, server_tag)` row when the composite unique index from
+/// [`AuthSession::generate_unique_meta_key_pair_sql`](super::model::AuthSession::generate_unique_meta_key_pair_sql)
+/// is installed.
+///
+/// Returns the number of rows removed.
+///
+/// # Arguments
+///
+/// * `key1` - The first top-level key to look for in `meta`.
+/// * `value1` - The JSON value the first key must equal.
+/// * `key2` - The second top-level key to look for in `meta`.
+/// * `value2` - The JSON value the second key must equal.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if the query fails.
+#[db_transaction(AuthPostGresDescriptor, DeleteAuthSessionsByMetaKeyPair)]
+async fn delete_auth_sessions_by_meta_key_pair(
+    key1: &str,
+    value1: Value,
+    key2: &str,
+    value2: Value,
+) -> u64 {
+    let pool = T::yield_pool();
+    let result = sqlx::query(
+        "DELETE FROM saps.auth_sessions \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb, $3::text, $4::jsonb)",
+    )
+        .bind(key1)
+        .bind(value1)
+        .bind(key2)
+        .bind(value2)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
