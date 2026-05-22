@@ -20,5 +20,6 @@ define_dal_transactions!(
     DeleteAuthSessionsByMetaKey => delete_auth_sessions_by_meta_key(key: &str, value: Value) -> u64,
     DeleteAuthSessionsByMetaKeyPair => delete_auth_sessions_by_meta_key_pair(key1: &str, value1: Value, key2: &str, value2: Value) -> u64,
     UpsertAuthSessionsMetaKeyByMeta => upsert_auth_sessions_meta_key_by_meta(match_key: &str, match_value: Value, upsert_key: &str, upsert_value: Value) -> u64,
+    UpsertAuthSessionsMetaKeyByMetaKeyPair => upsert_auth_sessions_meta_key_by_meta_key_pair(match_key1: &str, match_value1: Value, match_key2: &str, match_value2: Value, upsert_key: &str, upsert_value: Value) -> u64,
     CompareAndSwapAuthSessionMeta => compare_and_swap_auth_session_meta[U: UserRole](session_id: &str, key: &str, expected: Value, new_value: Value) -> Option<AuthSession<U>>
 );

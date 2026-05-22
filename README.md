@@ -447,6 +447,43 @@ let sessions = AuthPostGresDescriptor::<LivePostGresPool>
 
 Sessions whose `meta` is `NULL` or whose `meta` is missing any of the queried keys never match — `@>` is strict containment, so a row with `{"user_id": 42}` does not match a lookup for `("user_id", 42, "server_tag", "app")`.
 
+### Upserting meta across sessions
+
+The token-scoped wrappers in [Updating session meta](#updating-session-meta) target one row — the session the JWT is bound to. The DAL also exposes two cross-session upserts that match by `meta` content rather than by session UUID. They're useful when you want to set the same flag on every session belonging to a user, or to one specific `(user, server)` slot, without first looking each row up.
+
+Both are a single `UPDATE` that combines a `meta @> jsonb_build_object(...)` filter with `jsonb_set(COALESCE(meta, '{}'::jsonb), ARRAY[upsert_key], upsert_value, true)` — so the match and the write are atomic, and a row with `NULL` meta is treated as `'{}'` when the upsert applies (though `NULL` rows can't pass the `@>` filter, so they're never touched in practice).
+
+```rust
+use saps::auth::dal::tx_definitions::{
+    UpsertAuthSessionsMetaKeyByMeta, UpsertAuthSessionsMetaKeyByMetaKeyPair,
+};
+use saps::dal::connections::{AuthPostGresDescriptor, LivePostGresPool};
+
+// Force every session for user 42 to take the "premium" flag.
+let count = AuthPostGresDescriptor::<LivePostGresPool>
+    ::upsert_auth_sessions_meta_key_by_meta(
+        "user_id", serde_json::json!(42),
+        "plan", serde_json::json!("premium"),
+    )
+    .await?;
+
+// Set "level"=3 only on user 42's app-server session, leaving any
+// metrics-server session for the same user untouched.
+let count = AuthPostGresDescriptor::<LivePostGresPool>
+    ::upsert_auth_sessions_meta_key_by_meta_key_pair(
+        "user_id", serde_json::json!(42),
+        "server_tag", serde_json::json!("app"),
+        "level", serde_json::json!(3),
+    )
+    .await?;
+```
+
+If `upsert_key` is already present on a matching row the existing value is overwritten; otherwise the key is inserted. Pair these with the partial unique indexes from [Enforcing uniqueness on a meta key](#enforcing-uniqueness-on-a-meta-key) / [pair](#enforcing-uniqueness-on-a-meta-key-pair) to guarantee the return value is `0` or `1`; without an index, every session matching the filter is updated.
+
+The upsert key may also be one of the match keys — useful for renaming a value in place. Matching `(user_id=1, server_tag="app")` and upserting `server_tag` → `"stage"` rewrites that row's `server_tag` from `"app"` to `"stage"`; Postgres evaluates the `WHERE` on the pre-update snapshot, so sibling rows that happen to share the old `server_tag` value aren't dragged along. Note that if a composite unique index is installed, an in-place rename that collides with an existing pair fails with a unique violation just like an insert would.
+
+The same pair-scoped upsert is also exposed on the token as `upsert_auth_sessions_meta_key_by_meta_key_pair(match_key1, match_value1, match_key2, match_value2, upsert_key, upsert_value)`. Unlike the other `*_meta_*` token wrappers, it takes `&self` (not `&mut self`) and does **not** refresh the cached session — the DAL returns a row count, not the post-update rows. If the call may have touched this token's own session and you need the new value locally, follow it with `token.refresh_auth_session().await?` or read through one of the non-`_local` `meta_get*` methods.
+
 ### Deleting sessions by meta
 
 Useful for logging a user out everywhere (single key) or out of one specific server (pair). Both return the number of rows removed.

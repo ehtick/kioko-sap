@@ -53,7 +53,7 @@ use super::{
         GetAuthSessionByMetaKey, GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict,
         GetAuthSessionsByMetaKey, GetAuthSessionsByMetaKeyPair, PingAuthSession,
         UpdateAuthSessionMeta, UpsertAuthSessionMetaKey,
-        UpsertAuthSessionsMetaKeyByMeta,
+        UpsertAuthSessionsMetaKeyByMeta, UpsertAuthSessionsMetaKeyByMetaKeyPair,
     },
 };
 use crate::{
@@ -640,6 +640,61 @@ async fn upsert_auth_sessions_meta_key_by_meta(
     )
         .bind(match_key)
         .bind(match_value)
+        .bind(upsert_key)
+        .bind(upsert_value)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Pair-scoped counterpart of [`upsert_auth_sessions_meta_key_by_meta`].
+///
+/// Sets `upsert_key`/`upsert_value` on every session whose `meta` contains
+/// both `(match_key1, match_value1)` and `(match_key2, match_value2)`,
+/// returning the number of rows that were updated. The lookup and the write
+/// happen in a single statement — there is no race between matching the pair
+/// and writing the new key.
+///
+/// Pair this with the composite partial unique index from
+/// [`AuthSession::generate_unique_meta_key_pair_sql`](super::model::AuthSession::generate_unique_meta_key_pair_sql)
+/// to guarantee the return value is `0` or `1`. Without that index, every
+/// session whose `meta` contains both match pairs is updated.
+///
+/// `meta` is coalesced from `NULL` to `'{}'::jsonb` before the upsert, though
+/// rows with `NULL` meta cannot match the `@>` containment filter and so will
+/// never be touched here in practice.
+///
+/// # Arguments
+///
+/// * `match_key1` - First top-level key used to find target session(s).
+/// * `match_value1` - JSON value the first match key must equal.
+/// * `match_key2` - Second top-level key used to find target session(s).
+/// * `match_value2` - JSON value the second match key must equal.
+/// * `upsert_key` - Top-level key to insert or overwrite in `meta`.
+/// * `upsert_value` - JSON value to associate with `upsert_key`.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` if the query fails.
+#[db_transaction(AuthPostGresDescriptor, UpsertAuthSessionsMetaKeyByMetaKeyPair)]
+async fn upsert_auth_sessions_meta_key_by_meta_key_pair(
+    match_key1: &str,
+    match_value1: Value,
+    match_key2: &str,
+    match_value2: Value,
+    upsert_key: &str,
+    upsert_value: Value,
+) -> u64 {
+    let pool = T::yield_pool();
+    let result = sqlx::query(
+        "UPDATE saps.auth_sessions \
+         SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), ARRAY[$5], $6, true) \
+         WHERE meta @> jsonb_build_object($1::text, $2::jsonb, $3::text, $4::jsonb)",
+    )
+        .bind(match_key1)
+        .bind(match_value1)
+        .bind(match_key2)
+        .bind(match_value2)
         .bind(upsert_key)
         .bind(upsert_value)
         .execute(pool)

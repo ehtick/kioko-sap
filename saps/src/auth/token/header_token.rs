@@ -76,7 +76,7 @@ use crate::{
             tx_definitions::{
                 CompareAndSwapAuthSessionMeta, DeleteAuthSession, DeleteAuthSessionMetaKey,
                 GetAuthSessionStrict, PingAuthSession, UpdateAuthSessionMeta,
-                UpsertAuthSessionMetaKey,
+                UpsertAuthSessionMetaKey, UpsertAuthSessionsMetaKeyByMetaKeyPair,
             },
         },
         middleware::CookieSlot,
@@ -344,6 +344,49 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
             self.auth_session = Some(session);
         }
         Ok(())
+    }
+
+    /// Sets `upsert_key`/`upsert_value` on every session whose `meta` matches
+    /// both `(match_key1, match_value1)` and `(match_key2, match_value2)`,
+    /// returning the number of rows updated.
+    ///
+    /// Wraps
+    /// [`AuthPostGresDescriptor::<Z>::upsert_auth_sessions_meta_key_by_meta_key_pair`].
+    /// Unlike the other `*_meta_*` methods on this token, the match is keyed
+    /// on the pair — not on `self.unique_id` — so the call may touch zero
+    /// rows, this token's row, sibling rows, or all of the above. Pair with
+    /// the composite partial unique index from
+    /// [`AuthSession::generate_unique_meta_key_pair_sql`](crate::auth::dal::model::AuthSession::generate_unique_meta_key_pair_sql)
+    /// to guarantee the return value is `0` or `1`.
+    ///
+    /// The cached [`auth_session`](Self::auth_session) is **not** updated by
+    /// this call (the DAL returns a row count, not the post-update rows). If
+    /// you need the latest meta on this token afterwards, call
+    /// [`refresh_auth_session`](Self::refresh_auth_session) or use one of
+    /// the non-`_local` `meta_get*` methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the database query fails.
+    pub async fn upsert_auth_sessions_meta_key_by_meta_key_pair(
+        &self,
+        match_key1: &str,
+        match_value1: serde_json::Value,
+        match_key2: &str,
+        match_value2: serde_json::Value,
+        upsert_key: &str,
+        upsert_value: serde_json::Value,
+    ) -> Result<u64, SapsError> {
+        let count = AuthPostGresDescriptor::<Z>::upsert_auth_sessions_meta_key_by_meta_key_pair(
+            match_key1,
+            match_value1,
+            match_key2,
+            match_value2,
+            upsert_key,
+            upsert_value,
+        )
+        .await?;
+        Ok(count)
     }
 
     /// Removes a single top-level `key` from the auth session's `meta`,

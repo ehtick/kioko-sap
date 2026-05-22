@@ -456,7 +456,7 @@ mod tests {
         GetAuthSession, GetAuthSessionByMetaKey,
         GetAuthSessionByMetaKeyStrict, GetAuthSessionStrict, GetAuthSessionsByMetaKey,
         GetAuthSessionsByMetaKeyPair, PingAuthSession, UpsertAuthSessionMetaKey,
-        UpsertAuthSessionsMetaKeyByMeta,
+        UpsertAuthSessionsMetaKeyByMeta, UpsertAuthSessionsMetaKeyByMetaKeyPair,
     };
     use crate::errors::saps::SapsErrorStatus;
     use crate::dal::connections::AuthPostGresDescriptor;
@@ -1504,6 +1504,198 @@ mod tests {
         .expect("get session")
         .expect("session should exist");
         assert_eq!(unchanged.meta, Some(serde_json::json!({"user_id": 2})));
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_key_pair_updates_only_matching_pair() {
+        let target = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create target");
+        let other_server = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("create other server");
+        let other_user = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Customer)
+                .with_meta(serde_json::json!({"user_id": 2, "server_tag": "app"})),
+        )
+        .await
+        .expect("create other user");
+
+        let count = AuthPostGresDescriptor::<TestDbHandle>
+            ::upsert_auth_sessions_meta_key_by_meta_key_pair(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("app"),
+                "level",
+                serde_json::json!(3),
+            )
+            .await
+            .expect("upsert by meta key pair");
+        assert_eq!(count, 1);
+
+        let updated = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &target.id.to_string(),
+        )
+        .await
+        .expect("get target")
+        .expect("target should exist");
+        assert_eq!(
+            updated.meta,
+            Some(serde_json::json!({"user_id": 1, "server_tag": "app", "level": 3}))
+        );
+
+        // Other rows must be untouched.
+        let other_server = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &other_server.id.to_string(),
+        )
+        .await
+        .expect("get other server")
+        .expect("session should exist");
+        assert_eq!(
+            other_server.meta,
+            Some(serde_json::json!({"user_id": 1, "server_tag": "metrics"}))
+        );
+        let other_user = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &other_user.id.to_string(),
+        )
+        .await
+        .expect("get other user")
+        .expect("session should exist");
+        assert_eq!(
+            other_user.meta,
+            Some(serde_json::json!({"user_id": 2, "server_tag": "app"}))
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_key_pair_overwrites_existing_key() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin).with_meta(
+                serde_json::json!({"user_id": 1, "server_tag": "app", "level": 1}),
+            ),
+        )
+        .await
+        .expect("create");
+
+        let count = AuthPostGresDescriptor::<TestDbHandle>
+            ::upsert_auth_sessions_meta_key_by_meta_key_pair(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("app"),
+                "level",
+                serde_json::json!(5),
+            )
+            .await
+            .expect("upsert by meta key pair");
+        assert_eq!(count, 1);
+
+        let fetched = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &created.id.to_string(),
+        )
+        .await
+        .expect("get")
+        .expect("session should exist");
+        assert_eq!(
+            fetched.meta,
+            Some(serde_json::json!({"user_id": 1, "server_tag": "app", "level": 5}))
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_key_pair_upsert_key_is_one_of_match_keys() {
+        let target = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create target");
+        // Sibling row that must not be touched.
+        let sibling = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "metrics"})),
+        )
+        .await
+        .expect("create sibling");
+
+        // Match by (user_id=1, server_tag="app") and then overwrite server_tag itself.
+        let count = AuthPostGresDescriptor::<TestDbHandle>
+            ::upsert_auth_sessions_meta_key_by_meta_key_pair(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("app"),
+                "server_tag",
+                serde_json::json!("stage"),
+            )
+            .await
+            .expect("upsert by meta key pair");
+        assert_eq!(count, 1);
+
+        let updated = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &target.id.to_string(),
+        )
+        .await
+        .expect("get target")
+        .expect("target should exist");
+        assert_eq!(
+            updated.meta,
+            Some(serde_json::json!({"user_id": 1, "server_tag": "stage"}))
+        );
+
+        // Sibling untouched — confirms WHERE matched on pre-update state and
+        // didn't cascade to the row that now shares its old server_tag value.
+        let sibling = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &sibling.id.to_string(),
+        )
+        .await
+        .expect("get sibling")
+        .expect("session should exist");
+        assert_eq!(
+            sibling.meta,
+            Some(serde_json::json!({"user_id": 1, "server_tag": "metrics"}))
+        );
+    }
+
+    #[saps::db_test]
+    async fn test_upsert_meta_by_meta_key_pair_no_matches_returns_zero() {
+        let created = AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(
+            AuthSession::new(TestRole::Admin)
+                .with_meta(serde_json::json!({"user_id": 1, "server_tag": "app"})),
+        )
+        .await
+        .expect("create");
+
+        let count = AuthPostGresDescriptor::<TestDbHandle>
+            ::upsert_auth_sessions_meta_key_by_meta_key_pair(
+                "user_id",
+                serde_json::json!(1),
+                "server_tag",
+                serde_json::json!("metrics"),
+                "level",
+                serde_json::json!(3),
+            )
+            .await
+            .expect("upsert by meta key pair");
+        assert_eq!(count, 0);
+
+        let unchanged = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(
+            &created.id.to_string(),
+        )
+        .await
+        .expect("get")
+        .expect("session should exist");
+        assert_eq!(
+            unchanged.meta,
+            Some(serde_json::json!({"user_id": 1, "server_tag": "app"}))
+        );
     }
 
     #[test]
