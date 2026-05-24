@@ -539,7 +539,6 @@ name = "embedded-db"
 version = "0.1.0"
 dependencies = [
  "saps",
- "saps-db-embedded-pool-macro",
  "sqlx",
  "tokio",
 ]
@@ -2185,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "saps"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "axum",
  "base64",

@@ -241,6 +241,84 @@ This gives us another oncelocked pool under the `SECOND_LIVE_POOL` variable that
 - `"DATABASE_URL_TWO"`: The URL connection string to the database
 - `"DB_MAX_CONNECTIONS_TWO"`: The maximum number of connections that the connection pool has
 
+### Embedded PostgreSQL pool
+
+If you don't want to point at an external database — for staging deploys, self-contained demo binaries, or local development without docker — saps can boot a real PostgreSQL process inside your binary and hand back an `sqlx::PgPool` connected to it. The embedded server is provided by [`postgresql_embedded`](https://crates.io/crates/postgresql_embedded).
+
+Turn it on by enabling the `embedded_postgres` feature on saps in your crate's `Cargo.toml`:
+
+```toml
+[dependencies]
+saps = { version = "0.4", features = ["embedded_postgres"] }
+```
+
+The feature unlocks the [`saps::dal::embedded_connections`](saps/src/dal/embedded_connections.rs) module which ships a framework-integrated `YieldPostGresPool` handle so the embedded pool slots directly into every component that already takes a postgres handle (DAL transactions, `AuthPostGresDescriptor`, the worker pool, etc.). Booting embedded postgres is async (it may download binaries to `~/.theseus/postgresql` on first run), so the handle is paired with an async `init_live_embedded_postgres_pool()` initializer that you `await` once at startup:
+
+```rust
+use saps::dal::connections::YieldPostGresPool;
+use saps::dal::embedded_connections::{
+    LiveEmbeddedPostgresPool, init_live_embedded_postgres_pool,
+};
+
+#[tokio::main]
+async fn main() {
+    // Boots the embedded server, creates EMBEDDED_DATABASE_NAME if it doesn't
+    // already exist, and connects a PgPool to it. Subsequent calls are no-ops
+    // and return the cached pool.
+    init_live_embedded_postgres_pool().await;
+
+    // Now anything keyed on YieldPostGresPool can take LiveEmbeddedPostgresPool
+    // in place of LivePostGresPool.
+    let pool = LiveEmbeddedPostgresPool::yield_pool();
+    sqlx::query("CREATE TABLE IF NOT EXISTS notes (id SERIAL PRIMARY KEY, body TEXT NOT NULL)")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+```
+
+The handle reads two environment variables:
+
+- `"EMBEDDED_DATABASE_NAME"`: name of the database to create inside the embedded server
+- `"DB_MAX_CONNECTIONS"`: maximum number of connections that the `PgPool` holds (defaults to `5` if unset)
+
+A keep-alive static inside the module holds the running `postgresql_embedded::PostgreSQL` handle for the lifetime of the program, so the child process never gets dropped while the pool is in use.
+
+To wire it into the rest of the framework, hand `LiveEmbeddedPostgresPool` to any descriptor that already accepts a `YieldPostGresPool` parameter — for example a router factory that previously took `LivePostGresPool`:
+
+```rust
+use saps::axum::{Router, routing::post};
+use saps::dal::connections::SqlxPostGresDescriptor;
+use saps::dal::embedded_connections::LiveEmbeddedPostgresPool;
+
+pub fn users_factory(app: Router) -> Router {
+    app.route(
+        "/api/v1/users",
+        post(create::create_user_handler::<SqlxPostGresDescriptor<LiveEmbeddedPostgresPool>>),
+    )
+}
+```
+
+For a runnable end-to-end demo (boot embedded postgres, create a table, insert/read rows back) see [`examples/embedded-db`](examples/embedded-db).
+
+#### Defining your own embedded pools
+
+If you want a second embedded pool (or want to swap env-var names), the underlying machinery is exposed as the [`saps::define_embedded_pg_pool!`](macros/db-embedded-pool-macro) macro, mirroring the shape of `define_pg_pool!`:
+
+```rust
+use saps::define_embedded_pg_pool;
+
+define_embedded_pg_pool!(SECOND_EMBEDDED_POOL, "SECOND_EMBEDDED_DB_NAME", "DB_MAX_CONNECTIONS_TWO");
+
+// At startup:
+let pool: &'static sqlx::PgPool = init_second_embedded_pool().await;
+```
+
+Each invocation emits a `tokio::sync::OnceCell<PgPool>` named after the pool identifier, a keep-alive `OnceCell<PostgreSQL>` that holds the server handle, and an async `init_<pool_lowercase>()` initializer that returns `&'static PgPool`. Implement `YieldPostGresPool` on a marker struct the same way `LiveEmbeddedPostgresPool` does to plug the new pool into the rest of the framework.
+
+> [!NOTE]
+> By default the postgres binaries are downloaded on first run and cached under `~/.theseus/postgresql`. To bake the binaries directly into your release artifact instead, enable `postgresql_embedded`'s `bundled` feature in your own `Cargo.toml` — the archive is then embedded at build time and no network access is required at runtime.
+
 
 ## Config Variables
 

@@ -1,16 +1,16 @@
-//! Boots an embedded PostgreSQL instance via the `define_embedded_pg_pool!`
-//! macro and runs a handful of raw `sqlx` queries against it.
+//! Boots an embedded PostgreSQL instance via the framework-integrated
+//! [`LiveEmbeddedPostgresPool`] handle and runs a handful of raw `sqlx` queries
+//! against it.
 //!
 //! Run with:
 //!     cargo run -p embedded-db
 //!
-//! Override defaults via env vars `EMBEDDED_DB_NAME` and `DB_MAX_CONNECTIONS`.
+//! Override defaults via env vars `EMBEDDED_DATABASE_NAME` and `DB_MAX_CONNECTIONS`.
 
-saps_db_embedded_pool_macro::define_embedded_pg_pool!(
-    EMBEDDED_POOL,
-    "EMBEDDED_DB_NAME",
-    "DB_MAX_CONNECTIONS"
-);
+use saps::dal::connections::YieldPostGresPool;
+use saps::dal::embedded_connections::{
+    LiveEmbeddedPostgresPool, init_live_embedded_postgres_pool,
+};
 
 fn ensure_env(key: &str, default: &str) {
     if std::env::var_os(key).is_none() {
@@ -21,12 +21,15 @@ fn ensure_env(key: &str, default: &str) {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ensure_env("EMBEDDED_DB_NAME", "demo");
+    ensure_env("EMBEDDED_DATABASE_NAME", "demo");
     ensure_env("DB_MAX_CONNECTIONS", "5");
 
     println!("[1/5] Booting embedded PostgreSQL (may download binaries on first run)...");
-    let pool = init_embedded_pool().await;
+    init_live_embedded_postgres_pool().await;
     println!("       embedded PostgreSQL ready.");
+
+    // Now the framework-wide YieldPostGresPool handle is usable.
+    let pool = LiveEmbeddedPostgresPool::yield_pool();
 
     println!("[2/5] Creating `notes` table...");
     sqlx::query(
