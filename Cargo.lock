@@ -2199,7 +2199,7 @@ dependencies = [
  "rmp-serde",
  "rust-embed",
  "saps-background-task 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "saps-db-embedded-pool-macro",
+ "saps-db-embedded-pool-macro 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-pool-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-db-tx 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "saps-frontend-macro 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -2241,6 +2241,17 @@ version = "0.1.0"
 [[package]]
 name = "saps-db-embedded-pool-macro"
 version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "saps-db-embedded-pool-macro"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31aa53afda022cfaf3e670706e22f711b1dea14d39cee1fc68ea12d69c5604e3"
 dependencies = [
  "proc-macro2",
  "quote",
