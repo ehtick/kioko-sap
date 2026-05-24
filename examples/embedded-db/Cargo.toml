@@ -1,0 +1,10 @@
+[package]
+name = "embedded-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+saps = { workspace = true, features = ["embedded_postgres"] }
+saps-db-embedded-pool-macro = { path = "../../macros/db-embedded-pool-macro" }
+sqlx = { workspace = true }
+tokio = { workspace = true }

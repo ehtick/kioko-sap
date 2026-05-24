@@ -15,7 +15,7 @@ members = [
     "macros/test-macro", 
     "macros/frontend", 
     "macros/background-task"
-]
+, "macros/db-embedded-pool-macro", "examples/embedded-db"]
 
 [workspace.dependencies]
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "process", "macros", "time", "signal", "tracing"] }
@@ -75,6 +75,7 @@ dotenvy = "0.15"
 
 # Local Crates
 saps-db-pool-macro = { path = "macros/db-pool-macro" }
+saps-db-embedded-pool-macro = { path = "macros/db-embedded-pool-macro" }
 saps-db-tx = { path = "macros/db-tx" }
 saps-test-macro = { path = "macros/test-macro" }
 saps-background-task = { path = "macros/background-task" }
@@ -96,3 +97,6 @@ rust-embed = "8.11.0"
 # background tasks
 ctor = "1.0.6"
 cron = "0.16.0"
+
+# storage
+postgresql_embedded = { version = "0.20.2", features = ["tokio"] }
