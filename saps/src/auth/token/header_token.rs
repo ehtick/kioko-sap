@@ -172,12 +172,8 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
 }
 
 
-impl<X, Y, R, Z> HeaderToken<X, Y, R, Z>
-where
-    X: GetConfigVariable + Send + Sync,
-    Y: CheckUserRole + Send + Sync,
-    R: UserRole + Send + Sync,
-    Z: YieldPostGresPool + Send + Sync,
+impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
+    HeaderToken<X, Y, R, Z>
 {
     /// Creates a new token with a random UUID and an expiry derived from config.
     ///

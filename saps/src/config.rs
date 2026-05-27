@@ -111,7 +111,7 @@ use std::env;
 ///
 /// Implementations should return [`SapsError`] when a requested key is not found or
 /// cannot be retrieved. The error message should include the key name to aid debugging.
-pub trait GetConfigVariable {
+pub trait GetConfigVariable: Send + Sync {
     /// Retrieves the value of a configuration variable by name.
     ///
     /// # Arguments

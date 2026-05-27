@@ -25,7 +25,7 @@ pub struct LivePostGresPool;
 saps_db_pool_macro::define_pg_pool!(SQLX_POSTGRES_POOL, "DATABASE_URL", "DB_MAX_CONNECTIONS");
 
 /// An internal trait for defining access to the DB pool.
-pub trait YieldPostGresPool {
+pub trait YieldPostGresPool: Send + Sync {
     fn yield_pool() -> &'static Pool<Postgres>;
 }
 

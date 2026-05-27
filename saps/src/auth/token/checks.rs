@@ -75,7 +75,7 @@ use crate::errors::saps::SapsError;
 ///
 /// You typically don't implement this trait manually — instead, use the `construct_checks!`
 /// macro to generate check structs declaratively.
-pub trait CheckUserRole {
+pub trait CheckUserRole: Send + Sync {
     fn check_user_role<U: UserRole>(role: &U) -> Result<(), SapsError>;
 }
 
@@ -93,7 +93,13 @@ pub trait CheckUserRole {
 /// When using `construct_checks!` with an enum definition, all three impls (`ToString`,
 /// `TryFrom<String>`, and `UserRole`) are generated automatically.
 pub trait UserRole:
-    ToString + TryFrom<String, Error = SapsError> + Send + Unpin + Serialize + DeserializeOwned
+    ToString
+    + TryFrom<String, Error = SapsError>
+    + Send
+    + Sync
+    + Unpin
+    + Serialize
+    + DeserializeOwned
 {
 }
 

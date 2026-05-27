@@ -6,7 +6,7 @@ macro_rules! define_dal_transactions {
         $( $trait:ident => $func_name:ident $([ $($generic:tt)* ])? ($($param:ident : $ptype:ty),*) -> $rtype:ty ),* $(,)?
     ) => {
         $(
-            pub trait $trait {
+            pub trait $trait: Send + Sync {
                 fn $func_name $(< $($generic)* >)? ($($param : $ptype),*) -> impl std::future::Future<Output = sqlx::Result<$rtype>> + Send;
             }
         )*
