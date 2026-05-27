@@ -9,7 +9,7 @@ embed = ["dep:include_dir"]
 
 [dependencies]
 include_dir = { version = "0.7.4", optional = true }
-saps = { workspace = true }
+saps = { workspace = true, features = ["openapi"]}
 sqlx = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

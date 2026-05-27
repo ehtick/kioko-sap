@@ -29,6 +29,8 @@ pub use rust_embed;
 pub use sqlx;
 #[cfg(feature = "server")]
 pub use tokio;
+#[cfg(feature = "openapi")]
+pub use aide;
 #[cfg(feature = "embedded_postgres")]
 pub use postgresql_embedded;
 #[cfg(feature = "embedded_postgres")]

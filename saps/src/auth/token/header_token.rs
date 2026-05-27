@@ -71,37 +71,32 @@
 use crate::{
     auth::{
         auth_trace,
-        dal::{
-            model::AuthSession,
-            tx_definitions::{
-                CompareAndSwapAuthSessionMeta, DeleteAuthSession, DeleteAuthSessionMetaKey,
-                GetAuthSessionStrict, PingAuthSession, UpdateAuthSessionMeta,
-                UpsertAuthSessionMetaKey, UpsertAuthSessionsMetaKeyByMetaKeyPair,
-            },
-        },
-        middleware::CookieSlot,
+        dal::model::AuthSession,
         token::{
             checks::{CheckUserRole, UserRole},
-            cookies::AuthTokenCookie,
+            helper_methods::{
+                jwt_claims::JwtClaims,
+                meta::{
+                    compare_and_swap_auth_session_meta::compare_and_swap_auth_session_meta as cas_inner,
+                    delete_auth_session::delete_auth_session as delete_auth_session_inner,
+                    delete_auth_session_meta_key::delete_auth_session_meta_key as delete_meta_key_inner,
+                    refresh_auth_session::refresh_auth_session as refresh_auth_session_inner,
+                    update_auth_session_meta::update_auth_session_meta as update_meta_inner,
+                    upsert_auth_session_meta_key::upsert_auth_session_meta_key as upsert_meta_key_inner,
+                    upsert_auth_sessions_meta_key_by_meta_key_pair::upsert_auth_sessions_meta_key_by_meta_key_pair as upsert_pair_inner,
+                },
+                run_auth_extraction::run_auth_extraction,
+            },
         },
     },
     config::GetConfigVariable,
-    constants::AUTH_TOKEN_COOKIE_KEY,
-    dal::connections::{AuthPostGresDescriptor, YieldPostGresPool},
+    dal::connections::YieldPostGresPool,
     errors::saps::SapsError,
 };
-use axum::{
-    extract::FromRequestParts,
-    http::{
-        HeaderMap,
-        header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
-        request::Parts,
-    },
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::marker::PhantomData;
+use serde::{Deserialize, de::DeserializeOwned};
+use std::{future::Future, marker::PhantomData, pin::Pin};
 use uuid::Uuid;
 
 /// A `Set-Cookie` value produced by the extractor when the stored procedure
@@ -143,7 +138,9 @@ pub struct UpdatedAuthCookie(pub String);
 /// | `role` | No | Phantom marker for the concrete role enum `R` |
 /// | `auth_session` | No | The full [`AuthSession`] loaded from the DB during extraction |
 /// | `old_uuid` | No | The previous UUID when the extractor rotated the session, otherwise `None` |
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "openapi", derive(aide::OperationIo))]
+#[cfg_attr(feature = "openapi", aide(input))]
 pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> {
     /// The UUID that links this token to its `saps.auth_sessions` row.
     /// Stored as a string in the JWT payload.
@@ -152,16 +149,12 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     /// Set at creation time to `now + TOKEN_EXPIRE_MINS`.
     pub time_expire: DateTime<Utc>,
     /// Phantom marker for the config provider type `X`.
-    #[serde(skip)]
     pub var_handle: PhantomData<X>,
     /// Phantom marker for the role-check strategy type `Y`.
-    #[serde(skip)]
     pub role_handle: PhantomData<Y>,
     /// Phantom marker for the database pool provider type `Z`.
-    #[serde(skip)]
     pub db_handle: PhantomData<Z>,
     /// Phantom marker for the concrete role enum type `R`.
-    #[serde(skip)]
     pub role: PhantomData<R>,
     /// The session row loaded from `saps.auth_sessions` during extraction.
     ///
@@ -170,18 +163,21 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     /// reach the meta JSON via `auth_session.meta` (or the typed
     /// `AuthSession::meta_get*` helpers) and call further DAL operations
     /// without re-fetching the session.
-    #[serde(skip, default = "Option::default")]
     pub auth_session: Option<AuthSession<R>>,
     /// The previous UUID, populated only when the extractor detected a session
     /// rotation during [`FromRequestParts`]. `None` for freshly created tokens
     /// and for requests where no rotation occurred. Not part of the JWT payload —
     /// handlers can read this to log/observe rotation events.
-    #[serde(skip)]
     pub old_uuid: Option<String>,
 }
 
-impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
-    HeaderToken<X, Y, R, Z>
+
+impl<X, Y, R, Z> HeaderToken<X, Y, R, Z>
+where
+    X: GetConfigVariable + Send + Sync,
+    Y: CheckUserRole + Send + Sync,
+    R: UserRole + Send + Sync,
+    Z: YieldPostGresPool + Send + Sync,
 {
     /// Creates a new token with a random UUID and an expiry derived from config.
     ///
@@ -286,11 +282,10 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the UUID is malformed or the database query fails.
-    pub async fn delete_auth_session(&self) -> Result<bool, SapsError> {
-        let session_id = uuid::Uuid::parse_str(&self.unique_id)
-            .map_err(|e| SapsError::unknown(e.to_string()))?;
-        let deleted = AuthPostGresDescriptor::<Z>::delete_auth_session(session_id).await?;
-        Ok(deleted)
+    pub fn delete_auth_session(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SapsError>> + Send + '_>> {
+        Box::pin(delete_auth_session_inner::<Z>(&self.unique_id))
     }
 
     /// Replaces the entire `meta` JSON for this token's auth session.
@@ -305,16 +300,17 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the database query fails.
-    pub async fn update_auth_session_meta(
+    pub fn update_auth_session_meta(
         &mut self,
         meta: serde_json::Value,
-    ) -> Result<(), SapsError> {
-        AuthPostGresDescriptor::<Z>::update_auth_session_meta(&self.unique_id, meta.clone())
-            .await?;
-        if let Some(session) = self.auth_session.as_mut() {
-            session.meta = Some(meta);
-        }
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send + '_>> {
+        Box::pin(async move {
+            update_meta_inner::<Z>(&self.unique_id, meta.clone()).await?;
+            if let Some(session) = self.auth_session.as_mut() {
+                session.meta = Some(meta);
+            }
+            Ok(())
+        })
     }
 
     /// Sets a single top-level `key` in the auth session's `meta`, leaving all
@@ -329,21 +325,18 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the database query fails.
-    pub async fn upsert_auth_session_meta_key(
-        &mut self,
-        key: &str,
+    pub fn upsert_auth_session_meta_key<'a>(
+        &'a mut self,
+        key: &'a str,
         value: serde_json::Value,
-    ) -> Result<(), SapsError> {
-        let updated = AuthPostGresDescriptor::<Z>::upsert_auth_session_meta_key::<R>(
-            &self.unique_id,
-            key,
-            value,
-        )
-        .await?;
-        if let Some(session) = updated {
-            self.auth_session = Some(session);
-        }
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let updated = upsert_meta_key_inner::<R, Z>(&self.unique_id, key, value).await?;
+            if let Some(session) = updated {
+                self.auth_session = Some(session);
+            }
+            Ok(())
+        })
     }
 
     /// Sets `upsert_key`/`upsert_value` on every session whose `meta` matches
@@ -368,25 +361,23 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the database query fails.
-    pub async fn upsert_auth_sessions_meta_key_by_meta_key_pair(
-        &self,
-        match_key1: &str,
+    pub fn upsert_auth_sessions_meta_key_by_meta_key_pair<'a>(
+        &'a self,
+        match_key1: &'a str,
         match_value1: serde_json::Value,
-        match_key2: &str,
+        match_key2: &'a str,
         match_value2: serde_json::Value,
-        upsert_key: &str,
+        upsert_key: &'a str,
         upsert_value: serde_json::Value,
-    ) -> Result<u64, SapsError> {
-        let count = AuthPostGresDescriptor::<Z>::upsert_auth_sessions_meta_key_by_meta_key_pair(
+    ) -> Pin<Box<dyn Future<Output = Result<u64, SapsError>> + Send + 'a>> {
+        Box::pin(upsert_pair_inner::<Z>(
             match_key1,
             match_value1,
             match_key2,
             match_value2,
             upsert_key,
             upsert_value,
-        )
-        .await?;
-        Ok(count)
+        ))
     }
 
     /// Removes a single top-level `key` from the auth session's `meta`,
@@ -401,16 +392,17 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the database query fails.
-    pub async fn delete_auth_session_meta_key(&mut self, key: &str) -> Result<(), SapsError> {
-        let updated = AuthPostGresDescriptor::<Z>::delete_auth_session_meta_key::<R>(
-            &self.unique_id,
-            key,
-        )
-        .await?;
-        if let Some(session) = updated {
-            self.auth_session = Some(session);
-        }
-        Ok(())
+    pub fn delete_auth_session_meta_key<'a>(
+        &'a mut self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SapsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let updated = delete_meta_key_inner::<R, Z>(&self.unique_id, key).await?;
+            if let Some(session) = updated {
+                self.auth_session = Some(session);
+            }
+            Ok(())
+        })
     }
 
     /// Atomic compare-and-swap on a single top-level `meta` key for this
@@ -428,24 +420,21 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the database query fails.
-    pub async fn compare_and_swap_auth_session_meta(
-        &mut self,
-        key: &str,
+    pub fn compare_and_swap_auth_session_meta<'a>(
+        &'a mut self,
+        key: &'a str,
         expected: serde_json::Value,
         new_value: serde_json::Value,
-    ) -> Result<bool, SapsError> {
-        let updated = AuthPostGresDescriptor::<Z>::compare_and_swap_auth_session_meta::<R>(
-            &self.unique_id,
-            key,
-            expected,
-            new_value,
-        )
-        .await?;
-        let swapped = updated.is_some();
-        if let Some(session) = updated {
-            self.auth_session = Some(session);
-        }
-        Ok(swapped)
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SapsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let updated =
+                cas_inner::<R, Z>(&self.unique_id, key, expected, new_value).await?;
+            let swapped = updated.is_some();
+            if let Some(session) = updated {
+                self.auth_session = Some(session);
+            }
+            Ok(swapped)
+        })
     }
 
     /// Re-fetches the auth session from the database and stores it on the
@@ -465,11 +454,14 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// Returns [`SapsError`] if:
     /// - The session no longer exists in the database.
     /// - The query fails or the role cannot be parsed back into `R`.
-    pub async fn refresh_auth_session(&mut self) -> Result<&AuthSession<R>, SapsError> {
-        let session = AuthPostGresDescriptor::<Z>::get_auth_session_strict::<R>(&self.unique_id)
-            .await?;
-        self.auth_session = Some(session);
-        self.get_auth_session()
+    pub fn refresh_auth_session(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<&AuthSession<R>, SapsError>> + Send + '_>> {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.get_auth_session()
+        })
     }
 
     /// Reads `meta[key]` from the **cached** auth session attached to this
@@ -628,12 +620,16 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     ///
     /// Returns [`SapsError`] if the refresh fails (see
     /// [`refresh_auth_session`](Self::refresh_auth_session)).
-    pub async fn meta_get<'a>(
+    pub fn meta_get<'a>(
         &'a mut self,
-        key: &str,
-    ) -> Result<Option<&'a serde_json::Value>, SapsError> {
-        self.refresh_auth_session().await?;
-        self.meta_get_local(key)
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<&'a serde_json::Value>, SapsError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_local(key)
+        })
     }
 
     /// Refreshes the auth session from the database and reads `meta[key]`,
@@ -642,12 +638,16 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// # Errors
     ///
     /// Returns [`SapsError`] if the refresh fails.
-    pub async fn meta_get_owned(
-        &mut self,
-        key: &str,
-    ) -> Result<Option<serde_json::Value>, SapsError> {
-        self.refresh_auth_session().await?;
-        self.meta_get_owned_local(key)
+    pub fn meta_get_owned<'a>(
+        &'a mut self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, SapsError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_owned_local(key)
+        })
     }
 
     /// Refreshes the auth session from the database and reads `meta[key]`.
@@ -656,12 +656,16 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     ///
     /// Returns [`SapsError`] if the refresh fails, or
     /// [`SapsError::not_found`] if `key` is not present in `meta`.
-    pub async fn meta_get_strict<'a>(
+    pub fn meta_get_strict<'a>(
         &'a mut self,
-        key: &str,
-    ) -> Result<&'a serde_json::Value, SapsError> {
-        self.refresh_auth_session().await?;
-        self.meta_get_strict_local(key)
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<&'a serde_json::Value, SapsError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_strict_local(key)
+        })
     }
 
     /// Refreshes the auth session from the database and reads `meta[key]`,
@@ -671,30 +675,15 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     ///
     /// Returns [`SapsError`] if the refresh fails, or
     /// [`SapsError::not_found`] if `key` is not present in `meta`.
-    pub async fn meta_get_strict_owned(
-        &mut self,
-        key: &str,
-    ) -> Result<serde_json::Value, SapsError> {
-        self.refresh_auth_session().await?;
-        self.meta_get_strict_owned_local(key)
-    }
-
-    /// Refreshes the auth session from the database and reads `meta[key]`
-    /// deserialized as `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SapsError`] if the refresh fails, or if the value at `key`
-    /// cannot be decoded as `T`.
-    pub async fn meta_get_typed<'a, T>(
+    pub fn meta_get_strict_owned<'a>(
         &'a mut self,
-        key: &str,
-    ) -> Result<Option<T>, SapsError>
-    where
-        T: Deserialize<'a>,
-    {
-        self.refresh_auth_session().await?;
-        self.meta_get_typed_local(key)
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, SapsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_strict_owned_local(key)
+        })
     }
 
     /// Refreshes the auth session from the database and reads `meta[key]`
@@ -704,12 +693,36 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     ///
     /// Returns [`SapsError`] if the refresh fails, or if the value at `key`
     /// cannot be decoded as `T`.
-    pub async fn meta_get_typed_owned<T: DeserializeOwned>(
-        &mut self,
-        key: &str,
-    ) -> Result<Option<T>, SapsError> {
-        self.refresh_auth_session().await?;
-        self.meta_get_typed_owned_local(key)
+    pub fn meta_get_typed<'a, T>(
+        &'a mut self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<T>, SapsError>> + Send + 'a>>
+    where
+        T: Deserialize<'a> + Send + 'a,
+    {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_typed_local(key)
+        })
+    }
+
+    /// Refreshes the auth session from the database and reads `meta[key]`
+    /// deserialized as `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SapsError`] if the refresh fails, or if the value at `key`
+    /// cannot be decoded as `T`.
+    pub fn meta_get_typed_owned<'a, T: DeserializeOwned + Send + 'a>(
+        &'a mut self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<T>, SapsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_typed_owned_local(key)
+        })
     }
 
     /// Refreshes the auth session from the database and reads `meta[key]`
@@ -720,15 +733,18 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// Returns [`SapsError`] if the refresh fails, [`SapsError::not_found`]
     /// if `key` is not present, or a decode error if the value cannot be
     /// parsed as `T`.
-    pub async fn meta_get_typed_strict<'a, T>(
+    pub fn meta_get_typed_strict<'a, T>(
         &'a mut self,
-        key: &str,
-    ) -> Result<T, SapsError>
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<T, SapsError>> + Send + 'a>>
     where
-        T: Deserialize<'a>,
+        T: Deserialize<'a> + Send + 'a,
     {
-        self.refresh_auth_session().await?;
-        self.meta_get_typed_strict_local(key)
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_typed_strict_local(key)
+        })
     }
 
     /// Refreshes the auth session from the database and reads `meta[key]`
@@ -739,12 +755,15 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// Returns [`SapsError`] if the refresh fails, [`SapsError::not_found`]
     /// if `key` is not present, or a decode error if the value cannot be
     /// parsed as `T`.
-    pub async fn meta_get_typed_strict_owned<T: DeserializeOwned>(
-        &mut self,
-        key: &str,
-    ) -> Result<T, SapsError> {
-        self.refresh_auth_session().await?;
-        self.meta_get_typed_strict_owned_local(key)
+    pub fn meta_get_typed_strict_owned<'a, T: DeserializeOwned + Send + 'a>(
+        &'a mut self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<T, SapsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = refresh_auth_session_inner::<R, Z>(&self.unique_id).await?;
+            self.auth_session = Some(session);
+            self.meta_get_typed_strict_owned_local(key)
+        })
     }
 
     /// Encodes this token into a signed HS256 JWT string.
@@ -763,20 +782,14 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// - `SECRET_KEY` is not set in the config provider.
     /// - JWT encoding fails (should not happen with valid inputs).
     pub fn encode(self) -> Result<String, SapsError> {
-        let key_str = X::get_config_variable("SECRET_KEY".to_string())?;
-        let key = EncodingKey::from_secret(key_str.as_ref());
-        auth_trace!(
-            session_id = %self.unique_id,
-            time_expire = %self.time_expire,
-            "encoding JWT",
-        );
-        match encode(&Header::default(), &self, &key) {
-            Ok(token) => Ok(token),
-            Err(error) => {
-                auth_trace!(error = %error, "JWT encode failed");
-                Err(SapsError::unauthorized(error.to_string()))
-            }
+        // Delegate to the non-generic-over-(Y,R,Z) JwtClaims so the heavy
+        // jsonwebtoken machinery is monomorphized once per `X`, not once
+        // per `(X, Y, R, Z)`.
+        JwtClaims {
+            unique_id: self.unique_id,
+            time_expire: self.time_expire,
         }
+        .encode::<X>()
     }
 
     /// Decodes a JWT string into a `HeaderToken`.
@@ -796,167 +809,21 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// - The JWT signature is invalid.
     /// - The JWT payload cannot be deserialized into this struct.
     pub fn decode(token: &str) -> Result<Self, SapsError> {
-        let key_str = <X>::get_config_variable("SECRET_KEY".to_string())?;
-        let key = DecodingKey::from_secret(key_str.as_ref());
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.required_spec_claims.remove("exp");
-
-        match decode::<Self>(token, &key, &validation) {
-            Ok(token_data) => {
-                auth_trace!(
-                    session_id = %token_data.claims.unique_id,
-                    time_expire = %token_data.claims.time_expire,
-                    "decoded JWT",
-                );
-                Ok(token_data.claims)
-            }
-            Err(error) => {
-                auth_trace!(error = %error, "JWT decode failed");
-                Err(SapsError::unauthorized(error.to_string()))
-            }
-        }
+        // Delegate to JwtClaims for the same monomorphization-sharing reason
+        // as `encode`.
+        let claims = JwtClaims::decode::<X>(token)?;
+        Ok(HeaderToken {
+            unique_id: claims.unique_id,
+            time_expire: claims.time_expire,
+            var_handle: PhantomData,
+            role_handle: PhantomData,
+            db_handle: PhantomData,
+            role: PhantomData,
+            auth_session: None,
+            old_uuid: None,
+        })
     }
 
-    /// Extracts the JWT from the `Cookie` header using [`AUTH_TOKEN_COOKIE_KEY`].
-    ///
-    /// Parses the `Cookie` header value as a semicolon-separated list of `name=value`
-    /// pairs and looks for one matching [`AUTH_TOKEN_COOKIE_KEY`] (`saps-token`).
-    ///
-    /// # Arguments
-    ///
-    /// * `headers` — the request header map.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(token))` if the cookie was found.
-    /// - `Ok(None)` if the `Cookie` header is absent or doesn't contain the key.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SapsError::unauthorized`] if the `Cookie` header contains non-UTF-8 bytes.
-    fn extract_token_from_cookies(headers: &HeaderMap) -> Result<Option<String>, SapsError> {
-        let cookie_header = match headers.get(axum::http::header::COOKIE) {
-            Some(cookies) => cookies,
-            None => return Ok(None),
-        };
-
-        let cookies_str = cookie_header
-            .to_str()
-            .map_err(|_| SapsError::unauthorized("Invalid cookie format".to_string()))?;
-        Ok(Self::parse_cookie_value(cookies_str, AUTH_TOKEN_COOKIE_KEY))
-    }
-
-    /// Extracts the JWT from the custom `token` header.
-    ///
-    /// This is a legacy extraction method for clients that send the JWT in a header
-    /// named `token` rather than using cookies or the `Authorization` header.
-    ///
-    /// # Arguments
-    ///
-    /// * `headers` — the request header map.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(token))` if the `token` header was found.
-    /// - `Ok(None)` if the header is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SapsError::unauthorized`] if the header value contains non-UTF-8 bytes.
-    fn extract_token_from_header(headers: &HeaderMap) -> Result<Option<String>, SapsError> {
-        let raw_data = match headers.get("token") {
-            Some(token) => token,
-            None => return Ok(None),
-        };
-        let token = raw_data
-            .to_str()
-            .map_err(|_| SapsError::unauthorized("token not a valid string".to_string()))
-            .map(|s| s.to_string())?;
-        Ok(Some(token))
-    }
-
-    /// Extracts the JWT from the `Authorization` or `Sec-WebSocket-Protocol` header.
-    ///
-    /// This is the final fallback in the extraction chain. It checks two locations:
-    ///
-    /// 1. **`Sec-WebSocket-Protocol: bearer, <JWT>`** — used by WebSocket clients that
-    ///    cannot set custom headers. The subprotocol value must start with `bearer`
-    ///    (case-insensitive), followed by a comma and the JWT.
-    /// 2. **`Authorization: Bearer <JWT>`** — the standard OAuth 2.0 bearer token scheme.
-    ///
-    /// If neither header is present or valid, this method returns an error (unlike the
-    /// cookie and `token` header methods which return `Ok(None)`).
-    ///
-    /// # Arguments
-    ///
-    /// * `headers` — the request header map.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SapsError::unauthorized`] if:
-    /// - Neither `Sec-WebSocket-Protocol` nor `Authorization` headers are present.
-    /// - The `Authorization` header uses a scheme other than `Bearer`.
-    /// - The `Authorization` header has `Bearer` but no token value.
-    /// - Either header contains non-UTF-8 bytes.
-    pub fn extract_bearer_token(headers: &HeaderMap) -> Result<String, SapsError> {
-        // Prefer subprotocol: Sec-WebSocket-Protocol: bearer, <JWT>
-        if let Some(raw) = headers.get(SEC_WEBSOCKET_PROTOCOL) {
-            let s = raw
-                .to_str()
-                .map_err(|_| SapsError::unauthorized("Invalid Sec-WebSocket-Protocol header"))?;
-
-            if let Some((p1, p2)) = s.split_once(',')
-                && p1.trim().eq_ignore_ascii_case("bearer")
-            {
-                let jwt = p2.trim();
-                if !jwt.is_empty() {
-                    return Ok(jwt.to_owned());
-                }
-            }
-        }
-
-        // Fallback: Authorization: Bearer <token>
-        let raw = headers
-            .get(AUTHORIZATION)
-            .ok_or_else(|| SapsError::unauthorized("Missing Authorization header"))?;
-
-        let s = raw
-            .to_str()
-            .map_err(|_| SapsError::unauthorized("Invalid Authorization header"))?;
-
-        let mut parts = s.split_whitespace();
-        let scheme = parts.next().unwrap_or("");
-        let token = parts.next().unwrap_or("");
-
-        if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
-            return Err(SapsError::unauthorized("Expected 'Bearer <token>'"));
-        }
-        Ok(token.to_owned())
-    }
-
-    /// Parses a single cookie value from a raw `Cookie` header string.
-    ///
-    /// Splits the header on semicolons, trims whitespace, and returns the value
-    /// of the first cookie whose name matches `target_name`.
-    ///
-    /// # Arguments
-    ///
-    /// * `cookies` — the raw `Cookie` header string (e.g. `"foo=bar; saps-token=abc"`).
-    /// * `target_name` — the cookie name to search for.
-    ///
-    /// # Returns
-    ///
-    /// `Some(value)` if found, `None` otherwise.
-    fn parse_cookie_value(cookies: &str, target_name: &str) -> Option<String> {
-        cookies
-            .split(';')
-            .filter_map(|cookie| {
-                let cookie = cookie.trim();
-                cookie.split_once('=')
-            })
-            .find(|(name, _)| name.trim() == target_name)
-            .map(|(_, value)| value.trim().to_string())
-    }
 }
 
 /// Axum [`FromRequestParts`] implementation that performs the full authentication flow.
@@ -1006,233 +873,50 @@ where
     ///
     /// A fully validated `HeaderToken` with `meta` populated from the database, or
     /// a [`SapsError`] rejection.
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let headers = &parts.headers;
-        // Snapshot identifying request info up front so every trace from this
-        // extractor carries the same context. method+uri stay relevant even
-        // once we have a session_id and continue to be useful when we don't
-        // (e.g. cookie lookup misses, ping returns nothing, decode fails).
-        #[cfg(feature = "auth-tracing")]
-        let method = parts.method.clone();
-        #[cfg(feature = "auth-tracing")]
-        let uri = parts.uri.clone();
-        auth_trace!(
-            method = %method,
-            uri = %uri,
-            "from_request_parts — auth flow start",
-        );
+    // Thin shim over `run_auth_extraction`. The heavy lifting — token
+    // extraction, JWT decode, DB ping, rotation handling — lives in
+    // `run_auth_extraction` and is generic only over `(X, R, Z)`. The role
+    // check is the only `Y`-dependent step and stays here.
+    //
+    // The boxed return type prevents the (small) wrapping async state
+    // machine from being inlined into every handler call site.
+    #[allow(refining_impl_trait)]
+    fn from_request_parts<'p, 's>(
+        parts: &'p mut Parts,
+        _state: &'s S,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send + 'p>> {
+        Box::pin(async move {
+            let raw = run_auth_extraction::<X, R, Z>(parts).await?;
 
-        // Try cookie first, then the `token` header, then bearer as a fallback.
-        let raw_token = match Self::extract_token_from_cookies(headers)? {
-            Some(token) => {
+            // Verify the session's role satisfies the check strategy Y.
+            // This is the only place `Y` is consulted in the whole flow.
+            Y::check_user_role(&raw.session.role).map_err(|e| {
                 auth_trace!(
-                    method = %method,
-                    uri = %uri,
-                    source = "cookie",
-                    "from_request_parts — JWT located",
+                    session_id = %raw.unique_id,
+                    role = %raw.session.role.to_string(),
+                    error = %e.message,
+                    "from_request_parts — role check FAILED",
                 );
-                token
-            }
-            None => {
-                auth_trace!(
-                    method = %method,
-                    uri = %uri,
-                    "from_request_parts — no `saps-token` cookie, trying `token` header",
-                );
-                match Self::extract_token_from_header(headers)? {
-                    Some(token) => {
-                        auth_trace!(
-                            method = %method,
-                            uri = %uri,
-                            source = "token-header",
-                            "from_request_parts — JWT located",
-                        );
-                        token
-                    }
-                    None => {
-                        auth_trace!(
-                            method = %method,
-                            uri = %uri,
-                            "from_request_parts — no `token` header, falling back to bearer",
-                        );
-                        let token = Self::extract_bearer_token(headers).map_err(|e| {
-                            auth_trace!(
-                                method = %method,
-                                uri = %uri,
-                                error = %e.message,
-                                "from_request_parts — no JWT found in any supported location",
-                            );
-                            e
-                        })?;
-                        auth_trace!(
-                            method = %method,
-                            uri = %uri,
-                            source = "bearer",
-                            "from_request_parts — JWT located",
-                        );
-                        token
-                    }
-                }
-            }
-        };
-
-        // Decode the JWT and verify the signature.
-        let token = Self::decode(&raw_token).map_err(|e| {
+                e
+            })?;
             auth_trace!(
-                method = %method,
-                uri = %uri,
-                error = %e.message,
-                "from_request_parts — JWT decode failed",
+                session_id = %raw.unique_id,
+                role = %raw.session.role.to_string(),
+                rotated = raw.old_uuid.is_some(),
+                "from_request_parts — auth flow complete",
             );
-            e
-        })?;
 
-        let existing_id = token.unique_id.clone();
-        auth_trace!(
-            method = %method,
-            uri = %uri,
-            session_id = %existing_id,
-            time_expire = %token.time_expire,
-            "from_request_parts — JWT decoded, pinging session",
-        );
-
-        // Ping the session to keep it alive and check if it still exists.
-        // Sessions inactive for more than 10 minutes are deleted by the stored procedure.
-        let session = match AuthPostGresDescriptor::<Z>::ping_auth_session::<R>(
-            10,
-            &token.unique_id,
-        )
-        .await
-        .map_err(|e| {
-            auth_trace!(
-                method = %method,
-                uri = %uri,
-                session_id = %existing_id,
-                error = %e,
-                "from_request_parts — ping_auth_session DB call failed",
-            );
-            e
-        })?
-        {
-            Some(session) => session,
-            None => {
-                auth_trace!(
-                    method = %method,
-                    uri = %uri,
-                    session_id = %existing_id,
-                    "from_request_parts — session not present in DB (expired or never existed)",
-                );
-                return Err(SapsError::unauthorized("session not present"));
-            }
-        };
-
-        auth_trace!(
-            method = %method,
-            uri = %uri,
-            session_id = %existing_id,
-            returned_session_id = %session.id,
-            role = %session.role.to_string(),
-            date_created = %session.date_created,
-            last_interacted = %session.last_interacted,
-            meta = ?session.meta,
-            "from_request_parts — ping returned session",
-        );
-
-        // Verify the session's role satisfies the check strategy Y.
-        Y::check_user_role(&session.role).map_err(|e| {
-            auth_trace!(
-                method = %method,
-                uri = %uri,
-                session_id = %existing_id,
-                role = %session.role.to_string(),
-                error = %e.message,
-                "from_request_parts — role check FAILED",
-            );
-            e
-        })?;
-        auth_trace!(
-            method = %method,
-            uri = %uri,
-            session_id = %existing_id,
-            role = %session.role.to_string(),
-            "from_request_parts — role check passed",
-        );
-
-        let mut token = token;
-
-        // If the stored procedure regenerated the UUID (date_created was older than
-        // 5 minutes), update the token, build the refreshed cookie, and write it
-        // into the response-layer's CookieSlot if one is installed. The slot's
-        // interior mutability is what lets the layer (which already moved the
-        // request into next.run) observe the value after the handler returns.
-        if session.id.to_string() != existing_id {
-            auth_trace!(
-                method = %method,
-                uri = %uri,
-                session_id = %existing_id,
-                new_session_id = %session.id,
-                "from_request_parts — ROTATION detected, refreshing JWT and cookie",
-            );
-            token.unique_id = session.id.to_string();
-            // Refresh the JWT expiry on rotation. Without this, the rotated
-            // token carries the original login's `time_expire` through every
-            // refresh, so any future caller of `check_if_expired` would see a
-            // healthy session as expired the moment the original login window
-            // elapses (e.g. 20 minutes after first sign-in, even though the
-            // user has been active and their session has been rotating
-            // happily the whole time).
-            let token_expire_mins = X::get_config_variable("TOKEN_EXPIRE_MINS".into())?
-                .parse::<i64>()
-                .map_err(|e| SapsError::unknown(e.to_string()))?;
-            token.time_expire = Utc::now() + chrono::Duration::minutes(token_expire_mins);
-            auth_trace!(
-                method = %method,
-                uri = %uri,
-                session_id = %session.id,
-                time_expire = %token.time_expire,
-                token_expire_mins = token_expire_mins,
-                "from_request_parts — new time_expire applied to rotated token",
-            );
-            let new_jwt = token.encode()?;
-            let cookie_str = AuthTokenCookie::from(&new_jwt).yield_cookie_string();
-            if let Some(slot) = parts.extensions.get::<CookieSlot>() {
-                auth_trace!(
-                    method = %method,
-                    uri = %uri,
-                    session_id = %session.id,
-                    "from_request_parts — handing refreshed cookie to CookieSlot",
-                );
-                slot.set(UpdatedAuthCookie(cookie_str));
-            } else {
-                auth_trace!(
-                    method = %method,
-                    uri = %uri,
-                    session_id = %session.id,
-                    "from_request_parts — no CookieSlot in extensions; client will NOT receive new cookie (is `attach_refreshed_cookie` layer installed?)",
-                );
-            }
-            // re-decode the token so we return a valid struct (encode consumes self).
-            // Decoded tokens have `old_uuid = None` (it's #[serde(skip)]), so we
-            // re-apply the rotation marker after decoding.
-            token = Self::decode(&new_jwt)?;
-            token.old_uuid = Some(existing_id);
-        } else {
-            auth_trace!(
-                method = %method,
-                uri = %uri,
-                session_id = %existing_id,
-                "from_request_parts — no rotation, session UUID unchanged",
-            );
-        }
-        token.auth_session = Some(session);
-        auth_trace!(
-            method = %method,
-            uri = %uri,
-            session_id = %token.unique_id,
-            rotated = token.old_uuid.is_some(),
-            "from_request_parts — auth flow complete",
-        );
-        Ok(token)
+            Ok(HeaderToken {
+                unique_id: raw.unique_id,
+                time_expire: raw.time_expire,
+                var_handle: PhantomData,
+                role_handle: PhantomData,
+                db_handle: PhantomData,
+                role: PhantomData,
+                auth_session: Some(raw.session),
+                old_uuid: raw.old_uuid,
+            })
+        })
     }
 }
 
@@ -1243,6 +927,8 @@ mod tests {
     use crate::auth::token::checks::{
         AdminRoleCheck, CustomerRoleCheck, ExactAdminRoleCheck, NoRoleCheck, SuperAdminRoleCheck,
     };
+    use crate::auth::token::helper_methods::extract_bearer_token::extract_bearer_token;
+    use crate::dal::connections::AuthPostGresDescriptor;
     use crate::{
         auth::dal::model::AuthSession, dal::connections::MockDeadPostGresPool,
         errors::saps::SapsErrorStatus,
@@ -1250,7 +936,10 @@ mod tests {
     use axum::{
         Json, Router,
         body::{self, Body, Bytes},
-        http::{HeaderValue, Request, StatusCode},
+        http::{
+            HeaderMap, HeaderValue, Request, StatusCode,
+            header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
+        },
         response::IntoResponse,
         routing::get,
     };
@@ -1367,7 +1056,7 @@ mod tests {
     fn test_extract_bearer_token_from_authorization() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer abc123"));
-        let token = TkNo::extract_bearer_token(&headers).expect("token");
+        let token = extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "abc123");
     }
 
@@ -1375,14 +1064,14 @@ mod tests {
     fn test_extract_bearer_case_insensitive() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer   T0KEN"));
-        let token = TkNo::extract_bearer_token(&headers).expect("token");
+        let token = extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "T0KEN");
     }
 
     #[test]
     fn test_missing_authorization_header() {
         let headers = HeaderMap::new();
-        let err = TkNo::extract_bearer_token(&headers).expect_err("expected error");
+        let err = extract_bearer_token(&headers).expect_err("expected error");
         assert_eq!(err.status, SapsErrorStatus::Unauthorized);
         assert!(err.message.contains("Missing Authorization header"));
     }
@@ -1394,7 +1083,7 @@ mod tests {
             AUTHORIZATION,
             HeaderValue::from_static("Basic Zm9vOmJhcg=="),
         );
-        let err = TkNo::extract_bearer_token(&headers).expect_err("expected error");
+        let err = extract_bearer_token(&headers).expect_err("expected error");
         assert_eq!(err.status, SapsErrorStatus::Unauthorized);
         assert!(err.message.contains("Expected 'Bearer <token>'"));
     }
@@ -1403,7 +1092,7 @@ mod tests {
     fn test_bearer_without_token_is_unauthorized() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
-        let err = TkNo::extract_bearer_token(&headers).expect_err("expected error");
+        let err = extract_bearer_token(&headers).expect_err("expected error");
         assert_eq!(err.status, SapsErrorStatus::Unauthorized);
     }
 
@@ -1414,7 +1103,7 @@ mod tests {
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("bearer, jwt123"),
         );
-        let token = TkNo::extract_bearer_token(&headers).expect("token");
+        let token = extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "jwt123");
     }
 
@@ -1425,7 +1114,7 @@ mod tests {
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("BeArEr,    42-XYZ "),
         );
-        let token = TkNo::extract_bearer_token(&headers).expect("token");
+        let token = extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "42-XYZ");
     }
 
@@ -1437,7 +1126,7 @@ mod tests {
             HeaderValue::from_static("somethingelse, token-ignored"),
         );
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer real-token"));
-        let token = TkNo::extract_bearer_token(&headers).expect("token");
+        let token = extract_bearer_token(&headers).expect("token");
         assert_eq!(token, "real-token");
     }
 

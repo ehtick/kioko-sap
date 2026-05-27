@@ -1,6 +1,6 @@
 [package]
 name = "saps"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 description = "Core library for the SAP framework"
 license = "MIT"
@@ -38,6 +38,9 @@ saps-test-macro = { version = "0.1.2", optional = true }
 saps-frontend-macro = { version = "0.1.1", optional = true }
 saps-background-task = { version = "0.1.1", optional = true }
 
+# open api
+aide = { workspace = true, optional = true }
+
 [features]
 default = ["server"]
 embedded_postgres = ["dep:postgresql_embedded", "dep:saps-db-embedded-pool-macro"]
@@ -62,6 +65,7 @@ server = [
     "dep:saps-background-task",
 ]
 auth-tracing = []
+openapi = ["dep:aide"]
 
 [dev-dependencies]
 http-body-util = { workspace = true }
