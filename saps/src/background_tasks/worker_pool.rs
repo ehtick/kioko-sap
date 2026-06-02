@@ -283,7 +283,7 @@ async fn worker_cycle<Z: YieldPostGresPool + Sync + Send>(number: usize, interva
             None => {
                 // Step 5: No tasks available — sleep before polling again.
                 tokio::time::sleep(interval_duration).await;
-                tracing::info!("worker number {} polling", number);
+                tracing::trace!("worker number {} polling", number);
             }
         }
     }
