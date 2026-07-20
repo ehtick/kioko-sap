@@ -122,6 +122,91 @@ pub trait GetConfigVariable: Send + Sync {
     ///
     /// The value as a `String`, or a [`SapsError`] if the key is not found or retrieval fails.
     fn get_config_variable(variable: String) -> Result<String, SapsError>;
+
+    /// Retrieves a configuration variable and parses it into `T`.
+    ///
+    /// For **required** config: a key that is missing errors just like one that
+    /// does not parse. Use [`get_config_parsed_or`](GetConfigVariable::get_config_parsed_or)
+    /// when the key is optional and has a sensible default.
+    ///
+    /// The raw value is trimmed before parsing, so surrounding whitespace in an
+    /// environment variable does not cause a parse failure.
+    ///
+    /// # Arguments
+    ///
+    /// * `variable` — the name of the configuration key to look up (e.g. `"TOKEN_EXPIRE_MINS"`).
+    ///
+    /// # Returns
+    ///
+    /// The parsed value, or a [`SapsError`] if the key is not found or its value
+    /// does not parse into `T`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use saps::config::{GetConfigVariable, EnvConfig};
+    ///
+    /// // SAFETY: single-threaded doc test.
+    /// unsafe { std::env::set_var("MAX_RETRIES", "4"); }
+    ///
+    /// let retries: u32 = EnvConfig::get_config_parsed("MAX_RETRIES".into()).unwrap();
+    /// assert_eq!(retries, 4);
+    /// ```
+    fn get_config_parsed<T: std::str::FromStr>(variable: String) -> Result<T, SapsError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        Self::get_config_variable(variable.clone())?
+            .trim()
+            .parse::<T>()
+            .map_err(|e| SapsError::unknown(format!("{} could not be parsed: {}", variable, e)))
+    }
+
+    /// Retrieves a configuration variable and parses it into `T`, falling back
+    /// to `default` when the key is not set.
+    ///
+    /// For **optional** config: only the missing key falls back — a value that
+    /// is set but does not parse still errors loudly, because a misconfigured
+    /// value should be surfaced rather than silently replaced by the default.
+    ///
+    /// The raw value is trimmed before parsing, so surrounding whitespace in an
+    /// environment variable does not cause a parse failure.
+    ///
+    /// # Arguments
+    ///
+    /// * `variable` — the name of the configuration key to look up (e.g. `"MAX_TOKENS"`).
+    /// * `default` — the value returned when the key is not set.
+    ///
+    /// # Returns
+    ///
+    /// The parsed value, `default` if the key is not found, or a [`SapsError`]
+    /// if the key is set but its value does not parse into `T`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use saps::config::{GetConfigVariable, EnvConfig};
+    ///
+    /// // UNSET_LIMIT_EXAMPLE is not in the environment, so the default is used.
+    /// let limit: u32 = EnvConfig::get_config_parsed_or("UNSET_LIMIT_EXAMPLE".into(), 100).unwrap();
+    /// assert_eq!(limit, 100);
+    /// ```
+    fn get_config_parsed_or<T: std::str::FromStr>(
+        variable: String,
+        default: T,
+    ) -> Result<T, SapsError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match Self::get_config_variable(variable.clone()) {
+            // Key is present: it must parse, otherwise it's a config error.
+            Ok(raw) => raw.trim().parse::<T>().map_err(|e| {
+                SapsError::unknown(format!("{} could not be parsed: {}", variable, e))
+            }),
+            // Key is absent: use the supplied default.
+            Err(_) => Ok(default),
+        }
+    }
 }
 
 /// A configuration provider that reads directly from environment variables.
@@ -373,6 +458,80 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("not found in environment")
+        );
+    }
+
+    define_static_config!(ParsedConfig,
+        "MAX_TOKENS" => "8192",
+        "TEMPERATURE" => "0.25",
+        "ENABLED" => "true",
+        "PADDED_NUMBER" => " 42 ",
+        "BAD_NUMBER" => "not-a-number"
+    );
+
+    #[test]
+    fn test_get_config_parsed_returns_parsed_value() {
+        let tokens: u32 = ParsedConfig::get_config_parsed("MAX_TOKENS".into()).unwrap();
+        assert_eq!(tokens, 8192);
+    }
+
+    #[test]
+    fn test_get_config_parsed_is_generic_over_target_type() {
+        let temperature: f32 = ParsedConfig::get_config_parsed("TEMPERATURE".into()).unwrap();
+        assert_eq!(temperature, 0.25);
+
+        let enabled: bool = ParsedConfig::get_config_parsed("ENABLED".into()).unwrap();
+        assert!(enabled);
+    }
+
+    #[test]
+    fn test_get_config_parsed_trims_surrounding_whitespace() {
+        let padded: i64 = ParsedConfig::get_config_parsed("PADDED_NUMBER".into()).unwrap();
+        assert_eq!(padded, 42);
+    }
+
+    #[test]
+    fn test_get_config_parsed_errors_when_key_missing() {
+        let result = ParsedConfig::get_config_parsed::<u32>("NONEXISTENT_KEY".into());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("NONEXISTENT_KEY"));
+    }
+
+    #[test]
+    fn test_get_config_parsed_errors_when_value_unparseable() {
+        let result = ParsedConfig::get_config_parsed::<u32>("BAD_NUMBER".into());
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("BAD_NUMBER could not be parsed")
+        );
+    }
+
+    #[test]
+    fn test_get_config_parsed_or_returns_parsed_value_when_set() {
+        let tokens: u32 = ParsedConfig::get_config_parsed_or("MAX_TOKENS".into(), 100).unwrap();
+        assert_eq!(tokens, 8192);
+    }
+
+    #[test]
+    fn test_get_config_parsed_or_falls_back_to_default_when_key_missing() {
+        let tokens: u32 =
+            ParsedConfig::get_config_parsed_or("NONEXISTENT_KEY".into(), 100).unwrap();
+        assert_eq!(tokens, 100);
+    }
+
+    #[test]
+    fn test_get_config_parsed_or_errors_when_value_unparseable() {
+        // A set-but-invalid value must surface as an error, not be masked by the default.
+        let result = ParsedConfig::get_config_parsed_or::<u32>("BAD_NUMBER".into(), 100);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("BAD_NUMBER could not be parsed")
         );
     }
 }
