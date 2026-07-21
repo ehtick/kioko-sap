@@ -9,6 +9,7 @@ This framework combines `Svelte`, `Axum`, `Postgres`, and `sqlx` with helpful ma
 - [Auth](#auth)
 - [Embedding and serving a frontend](#embedding-and-serving-a-frontend)
 - [Background Tasks](#background-tasks)
+- [Base Docker image](#base-docker-image)
 - [Roadmap](#roadmap)
 
 ## DB Transactions
@@ -1464,6 +1465,120 @@ let outcome = add::<LivePostGresPool>(1, 2).await;
 
 Note that the `::<LivePostGresPool>` was added to the `add` function. This is because we need a handle to access the db pool. Remember, because it has the DB pool handle these background tasks can be involved in `#[db_test]` tests.
 
+
+## Base Docker image
+
+saps server builds extend a prebuilt base image that ships the full toolchain
+(Rust, Node, Deno, and `wasm-pack`). It is published to Docker Hub at
+[`maxwellflitton/saps-base`](https://hub.docker.com/repository/docker/maxwellflitton/saps-base/general)
+and built for both `linux/amd64` and `linux/arm64`.
+
+### Tag scheme
+
+Every image carries a version tag that encodes the pinned toolchain so you can
+tell at a glance what a given image ships with. The format is:
+
+```
+r<rust>-n<node>-d<deno>
+```
+
+The fields are always in this order — **r**ust, then **n**ode, then **d**eno:
+
+| Field | Tool | Example | Meaning                |
+|-------|------|---------|------------------------|
+| `r`   | Rust | `r1.93.0` | Rust toolchain version |
+| `n`   | Node | `n24`     | Node major version     |
+| `d`   | Deno | `d2.1.4`  | Deno version           |
+
+So `maxwellflitton/saps-base:r1.93.0-n24-d2.1.4` is Rust 1.93.0, Node 24.x, and
+Deno 2.1.4. The `wasm-pack` version is pinned in the build too but is kept out
+of the tag to keep it short — it tracks the Rust toolchain and is listed in
+[`scripts/deploy_docker.sh`](scripts/deploy_docker.sh). The same build is also
+published as `latest`.
+
+### Building and publishing
+
+The pinned versions live at the top of
+[`scripts/deploy_docker.sh`](scripts/deploy_docker.sh) as the single source of
+truth — they are passed into the [`Dockerfile`](Dockerfile) as build args and
+baked into the tag. To cut a new base image, bump the versions in that script
+and run (after `docker login`):
+
+```bash
+./scripts/deploy_docker.sh
+```
+
+This builds all platforms and pushes the version tag and `latest`. To build
+locally without pushing (single platform, loaded into your daemon):
+
+```bash
+PUSH=false ./scripts/deploy_docker.sh
+```
+
+### Using it to build and deploy a saps server
+
+The base image already ships everything a saps build needs — the pinned Rust
+toolchain (plus the `wasm32-unknown-unknown` target and `wasm-pack`), Node with
+`corepack`/`pnpm` enabled, and Deno. Your server's `Dockerfile` only has to
+`FROM` it, build the frontend, then compile the binary with the `embed` feature
+so the frontend is baked in (see
+[Embedding and serving a frontend](#embedding-and-serving-a-frontend)).
+
+A multi-stage build that produces a small runtime image looks like this:
+
+```dockerfile
+# ---- Build stage: use the saps base image (pin the tag you want) ----
+FROM maxwellflitton/saps-base:r1.93.0-n24-d2.1.4 AS build
+WORKDIR /app
+
+# Build the Svelte frontend first → emits frontend/web/public, which the
+# `embed` feature compiles into the binary.
+COPY frontend/web/package.json frontend/web/package-lock.json frontend/web/
+RUN cd frontend/web && npm ci
+COPY . .
+RUN cd frontend/web && npm run build
+
+# Compile the server with the frontend embedded.
+RUN cargo build --release --features embed
+
+# ---- Runtime stage: just the binary + its shared libs ----
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Replace `your-server` with your crate's package name (the binary in target/release).
+COPY --from=build /app/target/release/your-server /usr/local/bin/your-server
+
+EXPOSE 3000
+CMD ["your-server"]
+```
+
+Build and run it locally:
+
+```bash
+docker build -t your-server:latest .
+docker run --rm -p 3000:3000 \
+  -e DATABASE_URL="postgres://user:pass@host:5432/db" \
+  your-server:latest
+```
+
+To deploy, tag the image for your registry and push:
+
+```bash
+docker tag your-server:latest <registry>/your-org/your-server:latest
+docker push <registry>/your-org/your-server:latest
+```
+
+> [!TIP]
+> Because the base image is built for both `linux/amd64` and `linux/arm64`, you
+> can build and push your server for both in one go with the same `buildx`
+> approach used in [`scripts/deploy_docker.sh`](scripts/deploy_docker.sh):
+> `docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/your-org/your-server:latest --push .`
+
+Pin the base image tag (rather than `latest`) in your server's `Dockerfile` so
+your builds are reproducible — the [tag scheme](#tag-scheme) above tells you
+exactly which Rust, Node, and Deno versions you are pinning to.
 
 ## Roadmap
 
