@@ -217,7 +217,7 @@ where
         // `from_request_parts` for the reasoning — without this a long-lived
         // active session would appear expired the moment the original
         // login window elapsed.
-        let token_expire_mins = X::get_config_variable("TOKEN_EXPIRE_MINS".into())?
+        let token_expire_mins = X::get_config_variable("TOKEN_EXPIRE_MINS")?
             .parse::<i64>()
             .map_err(|e| SapsError::unknown(e.to_string()))?;
         let new_claims = JwtClaims {

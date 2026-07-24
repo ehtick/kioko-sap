@@ -28,7 +28,7 @@ impl JwtClaims {
     /// delegates here so the heavy `jsonwebtoken::encode` machinery is not
     /// monomorphized per `(X, Y, R, Z)`.
     pub fn encode<X: GetConfigVariable>(&self) -> Result<String, SapsError> {
-        let key_str = X::get_config_variable("SECRET_KEY".to_string())?;
+        let key_str = X::get_config_variable("SECRET_KEY")?;
         let key = EncodingKey::from_secret(key_str.as_ref());
         auth_trace!(
             session_id = %self.unique_id,
@@ -47,7 +47,7 @@ impl JwtClaims {
     /// Decodes a JWT string into [`JwtClaims`]. `exp` is intentionally not
     /// validated here — expiry checking is handled separately.
     pub fn decode<X: GetConfigVariable>(token: &str) -> Result<Self, SapsError> {
-        let key_str = <X>::get_config_variable("SECRET_KEY".to_string())?;
+        let key_str = <X>::get_config_variable("SECRET_KEY")?;
         let key = DecodingKey::from_secret(key_str.as_ref());
         let mut validation = Validation::new(Algorithm::HS256);
         validation.required_spec_claims.remove("exp");

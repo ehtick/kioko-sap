@@ -47,8 +47,8 @@ mod tests {
     struct TestConfig;
 
     impl GetConfigVariable for TestConfig {
-        fn get_config_variable(variable: String) -> Result<String, SapsError> {
-            match variable.as_str() {
+        fn get_config_variable(variable: &str) -> Result<String, SapsError> {
+            match variable {
                 "SECRET_KEY" => Ok("test_secret".to_string()),
                 "TOKEN_EXPIRE_MINS" => Ok("20".to_string()),
                 _ => Err(SapsError::unknown(format!("{} not found", variable))),

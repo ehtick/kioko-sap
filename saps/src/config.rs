@@ -34,7 +34,7 @@
 //! // SAFETY: single-threaded doc test.
 //! unsafe { std::env::set_var("SECRET_KEY", "my-secret"); }
 //!
-//! let secret = EnvConfig::get_config_variable("SECRET_KEY".into()).unwrap();
+//! let secret = EnvConfig::get_config_variable("SECRET_KEY").unwrap();
 //! assert_eq!(secret, "my-secret");
 //! ```
 //!
@@ -52,7 +52,7 @@
 //! AppConfig::init().expect("missing required config");
 //!
 //! // In handlers — fast, no env lookup:
-//! let secret = AppConfig::get_config_variable("SECRET_KEY".into()).unwrap();
+//! let secret = AppConfig::get_config_variable("SECRET_KEY").unwrap();
 //! ```
 //!
 //! If `init()` is not called before `get_config_variable`, the error message will
@@ -69,7 +69,7 @@
 //!     "TOKEN_EXPIRE_MINS" => "20"
 //! );
 //!
-//! let key = TestConfig::get_config_variable("SECRET_KEY".into()).unwrap();
+//! let key = TestConfig::get_config_variable("SECRET_KEY").unwrap();
 //! assert_eq!(key, "test_secret");
 //! ```
 //!
@@ -85,9 +85,9 @@
 //! struct MyCustomConfig;
 //!
 //! impl GetConfigVariable for MyCustomConfig {
-//!     fn get_config_variable(variable: String) -> Result<String, SapsError> {
+//!     fn get_config_variable(variable: &str) -> Result<String, SapsError> {
 //!         // Your lookup logic here — database, file, remote API, etc.
-//!         match variable.as_str() {
+//!         match variable {
 //!             "SECRET_KEY" => Ok("loaded-from-vault".to_string()),
 //!             _ => Err(SapsError::unknown(format!("{} not configured", variable))),
 //!         }
@@ -121,7 +121,7 @@ pub trait GetConfigVariable: Send + Sync {
     /// # Returns
     ///
     /// The value as a `String`, or a [`SapsError`] if the key is not found or retrieval fails.
-    fn get_config_variable(variable: String) -> Result<String, SapsError>;
+    fn get_config_variable(variable: &str) -> Result<String, SapsError>;
 
     /// Retrieves a configuration variable and parses it into `T`.
     ///
@@ -149,14 +149,14 @@ pub trait GetConfigVariable: Send + Sync {
     /// // SAFETY: single-threaded doc test.
     /// unsafe { std::env::set_var("MAX_RETRIES", "4"); }
     ///
-    /// let retries: u32 = EnvConfig::get_config_parsed("MAX_RETRIES".into()).unwrap();
+    /// let retries: u32 = EnvConfig::get_config_parsed("MAX_RETRIES").unwrap();
     /// assert_eq!(retries, 4);
     /// ```
-    fn get_config_parsed<T: std::str::FromStr>(variable: String) -> Result<T, SapsError>
+    fn get_config_parsed<T: std::str::FromStr>(variable: &str) -> Result<T, SapsError>
     where
         T::Err: std::fmt::Display,
     {
-        Self::get_config_variable(variable.clone())?
+        Self::get_config_variable(variable)?
             .trim()
             .parse::<T>()
             .map_err(|e| SapsError::unknown(format!("{} could not be parsed: {}", variable, e)))
@@ -188,17 +188,17 @@ pub trait GetConfigVariable: Send + Sync {
     /// use saps::config::{GetConfigVariable, EnvConfig};
     ///
     /// // UNSET_LIMIT_EXAMPLE is not in the environment, so the default is used.
-    /// let limit: u32 = EnvConfig::get_config_parsed_or("UNSET_LIMIT_EXAMPLE".into(), 100).unwrap();
+    /// let limit: u32 = EnvConfig::get_config_parsed_or("UNSET_LIMIT_EXAMPLE", 100).unwrap();
     /// assert_eq!(limit, 100);
     /// ```
     fn get_config_parsed_or<T: std::str::FromStr>(
-        variable: String,
+        variable: &str,
         default: T,
     ) -> Result<T, SapsError>
     where
         T::Err: std::fmt::Display,
     {
-        match Self::get_config_variable(variable.clone()) {
+        match Self::get_config_variable(variable) {
             // Key is present: it must parse, otherwise it's a config error.
             Ok(raw) => raw.trim().parse::<T>().map_err(|e| {
                 SapsError::unknown(format!("{} could not be parsed: {}", variable, e))
@@ -226,7 +226,7 @@ pub trait GetConfigVariable: Send + Sync {
 /// // SAFETY: single-threaded doc test.
 /// unsafe { std::env::set_var("MY_APP_KEY", "hello"); }
 ///
-/// let value = EnvConfig::get_config_variable("MY_APP_KEY".into()).unwrap();
+/// let value = EnvConfig::get_config_variable("MY_APP_KEY").unwrap();
 /// assert_eq!(value, "hello");
 /// ```
 #[derive(Debug, Clone)]
@@ -238,8 +238,8 @@ impl GetConfigVariable for EnvConfig {
     /// # Errors
     ///
     /// Returns [`SapsError`] if the environment variable is not set.
-    fn get_config_variable(variable: String) -> Result<String, SapsError> {
-        match env::var(&variable) {
+    fn get_config_variable(variable: &str) -> Result<String, SapsError> {
+        match env::var(variable) {
             Ok(val) => Ok(val),
             Err(_) => Err(SapsError::unknown(format!(
                 "{} not found in environment",
@@ -283,8 +283,8 @@ macro_rules! define_static_config {
         #[derive(Clone, Debug)]
         pub struct $handle;
         impl saps::config::GetConfigVariable for $handle {
-            fn get_config_variable(variable: String) -> Result<String, saps::errors::saps::SapsError> {
-                match variable.as_str() {
+            fn get_config_variable(variable: &str) -> Result<String, saps::errors::saps::SapsError> {
+                match variable {
                     $(
                         $key => Ok($value.to_string()),
                     )*
@@ -342,7 +342,7 @@ macro_rules! define_static_config {
 /// AppConfig::init().expect("failed to load config");
 ///
 /// // Then use via the trait — fast, no env lookup.
-/// let secret = AppConfig::get_config_variable("SECRET_KEY".into()).unwrap();
+/// let secret = AppConfig::get_config_variable("SECRET_KEY").unwrap();
 /// ```
 ///
 /// # Error messages
@@ -381,8 +381,8 @@ macro_rules! define_env_config {
             }
 
             impl saps::config::GetConfigVariable for $handle {
-                fn get_config_variable(variable: String) -> Result<String, saps::errors::saps::SapsError> {
-                    match variable.as_str() {
+                fn get_config_variable(variable: &str) -> Result<String, saps::errors::saps::SapsError> {
+                    match variable {
                         $(
                             $key => [< __CONFIG_ $handle:upper _ $key:upper >]
                                 .get()
@@ -418,16 +418,16 @@ mod tests {
 
         TestConfig::init().expect("init should succeed");
 
-        let secret = TestConfig::get_config_variable("TEST_SECRET_KEY".into()).unwrap();
+        let secret = TestConfig::get_config_variable("TEST_SECRET_KEY").unwrap();
         assert_eq!(secret, "my_secret");
 
-        let db_url = TestConfig::get_config_variable("TEST_DB_URL".into()).unwrap();
+        let db_url = TestConfig::get_config_variable("TEST_DB_URL").unwrap();
         assert_eq!(db_url, "postgres://localhost/test");
     }
 
     #[test]
     fn test_get_unknown_key_returns_error() {
-        let result = TestConfig::get_config_variable("NONEXISTENT_KEY".into());
+        let result = TestConfig::get_config_variable("NONEXISTENT_KEY");
         assert!(result.is_err());
         assert!(
             result
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_get_before_init_returns_error() {
         // Don't call init — OnceLock is empty
-        let result = UninitConfig::get_config_variable("UNINIT_VAR_XYZ".into());
+        let result = UninitConfig::get_config_variable("UNINIT_VAR_XYZ");
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("not initialised"));
     }
@@ -471,35 +471,35 @@ mod tests {
 
     #[test]
     fn test_get_config_parsed_returns_parsed_value() {
-        let tokens: u32 = ParsedConfig::get_config_parsed("MAX_TOKENS".into()).unwrap();
+        let tokens: u32 = ParsedConfig::get_config_parsed("MAX_TOKENS").unwrap();
         assert_eq!(tokens, 8192);
     }
 
     #[test]
     fn test_get_config_parsed_is_generic_over_target_type() {
-        let temperature: f32 = ParsedConfig::get_config_parsed("TEMPERATURE".into()).unwrap();
+        let temperature: f32 = ParsedConfig::get_config_parsed("TEMPERATURE").unwrap();
         assert_eq!(temperature, 0.25);
 
-        let enabled: bool = ParsedConfig::get_config_parsed("ENABLED".into()).unwrap();
+        let enabled: bool = ParsedConfig::get_config_parsed("ENABLED").unwrap();
         assert!(enabled);
     }
 
     #[test]
     fn test_get_config_parsed_trims_surrounding_whitespace() {
-        let padded: i64 = ParsedConfig::get_config_parsed("PADDED_NUMBER".into()).unwrap();
+        let padded: i64 = ParsedConfig::get_config_parsed("PADDED_NUMBER").unwrap();
         assert_eq!(padded, 42);
     }
 
     #[test]
     fn test_get_config_parsed_errors_when_key_missing() {
-        let result = ParsedConfig::get_config_parsed::<u32>("NONEXISTENT_KEY".into());
+        let result = ParsedConfig::get_config_parsed::<u32>("NONEXISTENT_KEY");
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("NONEXISTENT_KEY"));
     }
 
     #[test]
     fn test_get_config_parsed_errors_when_value_unparseable() {
-        let result = ParsedConfig::get_config_parsed::<u32>("BAD_NUMBER".into());
+        let result = ParsedConfig::get_config_parsed::<u32>("BAD_NUMBER");
         assert!(result.is_err());
         assert!(
             result
@@ -511,21 +511,21 @@ mod tests {
 
     #[test]
     fn test_get_config_parsed_or_returns_parsed_value_when_set() {
-        let tokens: u32 = ParsedConfig::get_config_parsed_or("MAX_TOKENS".into(), 100).unwrap();
+        let tokens: u32 = ParsedConfig::get_config_parsed_or("MAX_TOKENS", 100).unwrap();
         assert_eq!(tokens, 8192);
     }
 
     #[test]
     fn test_get_config_parsed_or_falls_back_to_default_when_key_missing() {
         let tokens: u32 =
-            ParsedConfig::get_config_parsed_or("NONEXISTENT_KEY".into(), 100).unwrap();
+            ParsedConfig::get_config_parsed_or("NONEXISTENT_KEY", 100).unwrap();
         assert_eq!(tokens, 100);
     }
 
     #[test]
     fn test_get_config_parsed_or_errors_when_value_unparseable() {
         // A set-but-invalid value must surface as an error, not be masked by the default.
-        let result = ParsedConfig::get_config_parsed_or::<u32>("BAD_NUMBER".into(), 100);
+        let result = ParsedConfig::get_config_parsed_or::<u32>("BAD_NUMBER", 100);
         assert!(result.is_err());
         assert!(
             result

@@ -191,7 +191,7 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
     /// - `TOKEN_EXPIRE_MINS` cannot be parsed as an `i64`.
     pub fn new<U: UserRole>() -> Result<Self, SapsError> {
         let token_expire_mins =
-            match X::get_config_variable("TOKEN_EXPIRE_MINS".into())?.parse::<i64>() {
+            match X::get_config_variable("TOKEN_EXPIRE_MINS")?.parse::<i64>() {
                 Ok(num) => num,
                 Err(error) => return Err(SapsError::unknown(error.to_string())),
             };
@@ -979,8 +979,8 @@ mod tests {
     struct FakeConfig;
 
     impl GetConfigVariable for FakeConfig {
-        fn get_config_variable(variable: String) -> Result<String, SapsError> {
-            match variable.as_str() {
+        fn get_config_variable(variable: &str) -> Result<String, SapsError> {
+            match variable {
                 "SECRET_KEY" => Ok("test_secret".to_string()),
                 "TOKEN_EXPIRE_MINS" => Ok("20".to_string()),
                 _ => Err(SapsError::unknown(format!(
