@@ -330,7 +330,7 @@ use saps::errors::saps::SapsError;
 
 
 pub fn check_var<C: GetConfigVariable>() -> Result<String, SapsError> {
-    C::get_config_variable("NAME".to_string())
+    C::get_config_variable("NAME")
 }
 
 
@@ -370,7 +370,7 @@ fn main() {
 
 What happens here essentially is that the `LiveConfig::init()` loops through all the keys provided and gets them from the environment variables. This means you will fail fast if an environment variable is missing. The macro creates oncelocks for each key and a match statement returning the specific oncelock variable depending on the key passed in. This gives us lock free reads that are faster than a hashmap until the number of keys gets into the 100s. Then it is advised that you should look into hashmaps. Once the `init` is called, the config cannot be altered, or reset for the duration of the program.
 
-It must be noted that every lookup clones the value at this point in time. This isn't too bad for now but will work on removing this and also removing the `to_string` requirement for passing in the key.
+It must be noted that every lookup clones the value at this point in time. This isn't too bad for now but will work on removing this.
 
 
 ## Auth
