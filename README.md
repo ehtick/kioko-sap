@@ -9,6 +9,8 @@ This framework combines `Svelte`, `Axum`, `Postgres`, and `sqlx` with helpful ma
 - [Auth](#auth)
 - [Embedding and serving a frontend](#embedding-and-serving-a-frontend)
 - [Background Tasks](#background-tasks)
+- [Files](#files)
+- [Base Docker image](#base-docker-image)
 - [Roadmap](#roadmap)
 
 ## DB Transactions
@@ -1464,6 +1466,488 @@ let outcome = add::<LivePostGresPool>(1, 2).await;
 
 Note that the `::<LivePostGresPool>` was added to the `add` function. This is because we need a handle to access the db pool. Remember, because it has the DB pool handle these background tasks can be involved in `#[db_test]` tests.
 
+
+## Files
+
+File and folder operations behind one API, so the code that reads or writes a file does not
+need to know where the bytes actually live. The same call runs against a real disk on a
+server, an embedded key-value store, an in-memory double in a test, or the browser's
+IndexedDB in a wasm build.
+
+This is not the postgres-backed blob store in the [Roadmap](#roadmap) — that stores file
+*records* (bytes plus owner, size, content-type) as rows in your database. This module is
+the layer below it: paths, directories, and file contents on whatever storage you point it
+at.
+
+The module is off by default. Enable the feature that matches your storage:
+
+| Feature | Adds | Target |
+|---|---|---|
+| `files` | typed paths, the IO traits, the disk and in-memory engines, in-memory buffers | any |
+| `files-kv` | the redb-backed key-value engine | native |
+| `files-indexed-db` | the browser IndexedDB engine and the browser state helpers | wasm only |
+
+```toml
+[dependencies]
+# a server reading and writing real files
+saps = { version = "0.5", features = ["files"] }
+
+# a browser build
+saps = { version = "0.5", default-features = false, features = ["files-indexed-db"] }
+```
+
+`files-kv` and `files-indexed-db` both imply `files`. The IndexedDB modules are
+additionally gated on `target_arch = "wasm32"`, so enabling the feature in a build that
+also targets native will not break the native half — those modules simply are not there.
+
+### Typed paths
+
+A file path and a folder path are different types. `Path<FilePath>` and `Path<FolderPath>`
+share one struct parameterised by a marker, so a function that takes a folder cannot be
+handed a file by mistake, and the compiler catches it rather than the filesystem.
+
+A path is always split into two halves: the **root** it lives under, and the part
+**relative** to that root. Keeping them apart is what lets the same relative path be
+resolved against a real project directory on a server and against a bare key prefix in
+IndexedDB, without the calling code changing.
+
+```rust
+use saps::files::paths::{FilePath, FolderPath, Path};
+
+// root + relative, kept separate
+let file = Path::<FilePath>::build("/srv/project".to_string(), "src/main.rs".to_string())?;
+
+// or one whole path, when there is no meaningful root
+let file = Path::<FilePath>::new("/srv/project/src/main.rs")?;
+
+// or from a tuple
+let file: Path<FilePath> = ("/srv/project".to_string(), "src/main.rs".to_string()).try_into()?;
+```
+
+Navigating between the two types is explicit, and each step is fallible because it can walk
+off the root:
+
+```rust
+let folder: Path<FolderPath> = file.clone().into_parent_folder()?;
+let sibling: Path<FilePath> = folder.clone().into_child_file("lib.rs")?;
+let nested: Path<FolderPath> = folder.into_child_folder("models")?;
+```
+
+Reading a path back:
+
+| Method | Returns |
+|---|---|
+| `relative()` | `&std::path::Path` — the part below the root |
+| `relative_string()` | `String` — the same, owned |
+| `root_string()` | `String` — the root it was built against |
+| `extension()` | `Option<String>` — file paths only |
+| `set_extension(&str)` | replaces the extension in place, file paths only |
+
+Two file paths compare and hash on their **relative** part, so the same file reached
+through two different roots is treated as the same file — which is what a buffer map keyed
+by path needs.
+
+#### Building paths from a root
+
+`adapters::file_paths` is the ergonomic front door when the root and the relative path are
+already separate values, which is the usual case in a handler:
+
+```rust
+use saps::files::adapters::file_paths::{file_path, file_path_str, folder_path, folder_path_str};
+
+let a = file_path_str("/srv/project", "src/main.rs")?;   // &str root
+let b = folder_path_str("/srv/project", "src")?;
+let c = file_path(project_dir, "src/main.rs")?;          // &std::path::Path root
+let d = folder_path(project_dir, "src")?;
+```
+
+### Engines
+
+An engine is a value you pass in rather than a global, so the same operation runs against a
+real disk in production and an in-memory double in a test without the operation knowing
+which it got.
+
+| Engine | Feature | Construction | Backing |
+|---|---|---|---|
+| `engines::blocking_io::disk::BlockingDiskIo` | `files` | `BlockingDiskIo` (unit struct) | the real filesystem |
+| `engines::blocking_io::mem::BlockingMemIo` | `files` | `BlockingMemIo::new()` | a map in memory |
+| `engines::async_io::mem::AsyncMemIo` | `files` | `AsyncMemIo::new()` | a map in memory, async |
+| `engines::blocking_io::kv::KvBlockingIo` | `files-kv` | `KvBlockingIo::new(path)?` | an embedded redb database |
+| `engines::async_io::indexed_db::IndexedDbIo` | `files-indexed-db` | `IndexedDbIo::new(db_name).await?` | browser IndexedDB |
+
+The in-memory engines exist for tests: swapping `BlockingDiskIo` for `BlockingMemIo::new()`
+gives a test an isolated filesystem with no temp directory and no cleanup.
+
+`engines::async_io::indexed_db::delete_database(name).await?` drops a whole IndexedDB
+database, for wiping browser state.
+
+### The IO traits
+
+The engines implement four traits, and every operation in `api` is generic over one of
+them. You rarely call these directly — `api` is the layer meant for application code — but
+they are what you implement to add a storage backend of your own.
+
+| Trait | Methods |
+|---|---|
+| `io::file::FileIo` | `read_file`, `write_file`, `exists`, `delete_file`, `move_file`, `copy_file` |
+| `io::folder::FolderIo` | `child_files`, `child_folders`, `all_child_files`, `create_folder`, `folder_exists`, `delete_folder`, `move_folder`, `copy_folder` |
+| `io::async_file::AsyncFileIo` | the `FileIo` set, `async` |
+| `io::async_folder::AsyncFolderIo` | the `FolderIo` set, `async` |
+
+### File operations
+
+Every operation is a module under `api::files`, and each module holds the same operation
+written for each execution context. They are separate functions rather than one function
+branching at runtime because the contexts have genuinely different signatures — an async
+engine has to be awaited, and a buffered write has to reach the open buffer rather than the
+store behind it.
+
+| Operation | `blocking` | `asynchronous` | `memfile_blocking` | `memfile_asynchronous` |
+|---|:-:|:-:|:-:|:-:|
+| `read` | ● | ● | ● | ● |
+| `write` | ● | ● | ● | ● |
+| `copy` | ● | ● | ● | ● |
+| `delete` | ● | ● | ● | ● |
+| `move_file` | ● | ● | ● | ● |
+| `exists` | ● | ● | ● | ● |
+| `apply_transaction` | | | ● | ● |
+
+The `blocking` and `asynchronous` variants take the engine directly; the `memfile_*`
+variants take a `MemFileGuard` instead and go through the live buffer, so an unsaved edit
+is visible to a read.
+
+```rust
+use saps::files::adapters::file_paths::file_path_str;
+use saps::files::api::files::{delete, exists, read, write};
+use saps::files::engines::blocking_io::disk::BlockingDiskIo;
+
+let path = file_path_str("/srv/project", "src/main.rs")?;
+
+write::blocking(&BlockingDiskIo, &path, "fn main() {}")?;
+let contents: String = read::blocking(&BlockingDiskIo, &path)?;
+let there: bool = exists::blocking(&BlockingDiskIo, &path);
+delete::blocking(&BlockingDiskIo, &path)?;
+```
+
+The async form is the same call shape against an async engine:
+
+```rust
+use saps::files::engines::async_io::mem::AsyncMemIo;
+
+let store = AsyncMemIo::new();
+write::asynchronous(&store, &path, "fn main() {}").await?;
+let contents = read::asynchronous(&store, &path).await?;
+```
+
+Note `exists` returns a bare `bool` rather than a `Result` — a storage failure and a
+missing file are the same answer to the question being asked.
+
+### Folder operations
+
+`api::folders` mirrors the same shape. The read-only listings and `create_folder` have no
+buffered form, because there is no buffer state for them to consult:
+
+| Operation | `blocking` | `asynchronous` | `memfile_blocking` | `memfile_asynchronous` |
+|---|:-:|:-:|:-:|:-:|
+| `child_files` | ● | ● | | |
+| `child_folders` | ● | ● | | |
+| `all_child_files` | ● | ● | | |
+| `create_folder` | ● | ● | | |
+| `exists` | ● | ● | | |
+| `copy` | ● | ● | ● | ● |
+| `delete` | ● | ● | ● | ● |
+| `move_folder` | ● | ● | ● | ● |
+
+`child_files` and `child_folders` list one level; `all_child_files` walks the whole subtree.
+
+```rust
+use saps::files::adapters::file_paths::folder_path_str;
+use saps::files::api::folders::{all_child_files, child_folders, create_folder};
+
+let dir = folder_path_str("/srv/project", "src")?;
+
+create_folder::blocking(&BlockingDiskIo, dir.clone())?;
+let immediate: Vec<Path<FolderPath>> = child_folders::blocking(&BlockingDiskIo, dir.clone())?;
+let everything: Vec<Path<FilePath>> = all_child_files::blocking(&BlockingDiskIo, dir)?;
+```
+
+The buffered variants of `copy`, `delete` and `move_folder` need an engine that does both
+halves, so they are bound as `S: FileIo + FolderIo` — moving a folder has to move the open
+buffers inside it, not just the directory entry.
+
+### Resolving a module path
+
+`api::mods::extract_path` resolves a module reference to the file that declares it,
+trying `<name>.<ext>` first and then `<name>/mod.<ext>`. It exists because that two-candidate
+lookup is the same in every language with a module system, and doing it by hand at each call
+site means probing existence twice everywhere:
+
+```rust
+use saps::files::api::mods::extract_path;
+
+let resolved = extract_path::blocking(&BlockingDiskIo, "/srv/project", "models/user")?;
+```
+
+All four variants are present (`blocking`, `asynchronous`, `memfile_blocking`,
+`memfile_asynchronous`).
+
+### In-memory buffers
+
+`files::mem_files` holds editable buffers. A buffer is backed by a CRDT document, so two
+replicas editing the same file concurrently converge rather than clobbering each other, and
+an edit can be sent to a peer as a compact update rather than a whole file.
+
+`MemFileGuard` owns the open buffers and borrows the store behind them. It is the type the
+`memfile_*` operations take:
+
+```rust
+use saps::files::files::mem_files::guard::MemFileGuard;
+
+let store = BlockingDiskIo;
+let mut guard = MemFileGuard::new(&store);
+
+guard.add_file(&path)?;                 // open a buffer, seeded from the store
+let file = guard.get_file(&path)?;      // opens it first if it is not resident
+guard.snapshot()?;                      // flush every open buffer back to the store
+```
+
+| Method | Does |
+|---|---|
+| `new(&store)` | opens a guard over a store |
+| `add_file(&path)` | loads a file into a buffer |
+| `get_file(&path)` | returns `&mut MemFile`, opening it if needed |
+| `load_all(folder)` | opens every file under a folder |
+| `is_resident(&path)` | whether a buffer is open, without opening one |
+| `reset_file(&path)` | discards buffered edits, reloading from the store |
+| `drop_file(&path)` / `drop_dir(&folder)` | closes buffers without saving |
+| `apply_transaction(&path, &tx)` | applies an edit batch, returns the CRDT update |
+| `apply_transactions(...)` | the same for several files at once |
+| `snapshot()` | saves every open buffer |
+| `store()` | the store the guard borrows |
+
+`AsyncMemFileGuard` is the same API against an `AsyncFileIo` engine, with the IO-touching
+methods `async`.
+
+A single buffer, if you want one without a guard, is `MemFile`. It builds
+`from_string`, `empty`, `from_file`, or `from_state` (a peer's encoded document), edits via
+`insert_char` / `insert_text` / `delete_char` / `delete_range`, reads via `contents()`, and
+writes back with `save()`. `flush_on_drop` makes it save when it goes out of scope.
+
+### Transactions
+
+An edit batch travels as a `kernel::transaction::Transaction` — an ordered list of insert,
+delete and swap operations against line/column positions. The list exists so a multi-edit
+change (a find-and-replace touching several places) moves as one unit:
+
+```rust
+use saps::kernel::transaction::{CursorIndex, DeleteSlice, InsertSlice, Operation, Transaction};
+
+let tx = Transaction::new(vec![
+    Operation::Insert(InsertSlice {
+        position: CursorIndex { line: 0, col: 0 },
+        content: "// header\n".to_string(),
+    }),
+    Operation::Delete(DeleteSlice {
+        position: CursorIndex { line: 4, col: 0 },
+        length: 12,
+    }),
+]);
+
+let update: Vec<u8> = guard.apply_transaction(&path, &tx)?;
+```
+
+Operations apply in list order, each resolved against the buffer as it stands after the
+earlier ones — so a later operation's position has to account for the edits before it.
+
+The returned `Vec<u8>` is the CRDT update the transaction produced: the minimal diff a
+replica needs to arrive at the same state. Broadcast that rather than the file.
+
+The `kernel` module these types live in is part of the crate's **baseline** — it needs no
+feature and pulls no dependencies beyond serde, so a wasm frontend and a native server can
+name the same types without either paying for the other's stack. Enable the `wasm` feature
+and `CursorIndex` gains a `#[wasm_bindgen]` export so JavaScript can construct one directly.
+
+### Sending open buffers to a joining peer
+
+`MemFileStreamer` walks a guard's open buffers and yields each one's whole-document state,
+which is what a client joining a session needs in order to catch up:
+
+```rust
+use saps::files::files::mem_files::streamer::MemFileStreamer;
+
+let streamer = MemFileStreamer::new(&guard);
+for (relative_path, state) in streamer.states() {
+    send_to_peer(relative_path, state);
+}
+```
+
+`count()` and `is_empty()` report how many buffers are open without materialising them.
+
+### Browser persistence
+
+Behind `files-indexed-db`, `files::mem_files::browser_state` is a ready-made buffer store
+for a browser client — a module-level set of buffers persisted to IndexedDB, so a page
+reload does not lose unsaved edits:
+
+| Function | Does |
+|---|---|
+| `configure_persistence(db_name)` | points the state at an IndexedDB database |
+| `insert_file_from_string(path, contents)` | opens a buffer from text |
+| `insert_file_from_state(path, state)` | opens a buffer from an origin's encoded state |
+| `read_file(path)` | the buffer's current contents |
+| `write_transaction_to_file(path, tx)` | applies an edit batch, returns the update to broadcast |
+| `apply_update_to_file(path, update)` | merges a peer's update in |
+| `subpaths_of(folder)` | the open buffers under a folder |
+| `remove_file(path)` / `wipe_state()` | drops one buffer, or all of them |
+| `flush_all()` | persists every buffer to IndexedDB |
+
+### Errors
+
+Every operation returns `errors::file::FileError`. One enum covers the whole module rather
+than a type per layer, because a caller reading a file does not want to match on a
+different error depending on whether the bytes came off a disk, a key-value store, or
+IndexedDB:
+
+| Variant | Means |
+|---|---|
+| `Io { path, message }` | the storage engine failed |
+| `Path { path, message }` | the path was not well formed for the operation |
+| `MemFile { path, message }` | an in-memory buffer operation failed |
+| `Graph { message }` | a file-graph operation failed |
+
+The backend's message is carried through unchanged, never reformatted — a missing file
+really does read `No such file or directory (os error 2)`, because callers and their tests
+match on that exact text.
+
+`FileError` converts into `SapsError`, so a handler can lift a file failure straight into
+an HTTP response with `?`:
+
+```rust
+use saps::errors::saps::SapsError;
+
+async fn get_file(path: Path<FilePath>) -> Result<String, SapsError> {
+    Ok(read::blocking(&BlockingDiskIo, &path)?)
+}
+```
+
+An ill-formed path becomes a `400`; IO, buffer and graph failures become a `500`. Outcomes
+that depend on intent rather than mechanism — a `404` for a file the caller expected to
+exist, a `409` for one that already does — are yours to raise from your own `exists` check,
+because only the handler knows which of those a missing file means.
+
+## Base Docker image
+
+saps server builds extend a prebuilt base image that ships the full toolchain
+(Rust, Node, Deno, and `wasm-pack`). It is published to Docker Hub at
+[`maxwellflitton/saps-base`](https://hub.docker.com/repository/docker/maxwellflitton/saps-base/general)
+and built for both `linux/amd64` and `linux/arm64`.
+
+### Tag scheme
+
+Every image carries a version tag that encodes the pinned toolchain so you can
+tell at a glance what a given image ships with. The format is:
+
+```
+r<rust>-n<node>-d<deno>
+```
+
+The fields are always in this order — **r**ust, then **n**ode, then **d**eno:
+
+| Field | Tool | Example | Meaning                |
+|-------|------|---------|------------------------|
+| `r`   | Rust | `r1.93.0` | Rust toolchain version |
+| `n`   | Node | `n24`     | Node major version     |
+| `d`   | Deno | `d2.1.4`  | Deno version           |
+
+So `maxwellflitton/saps-base:r1.93.0-n24-d2.1.4` is Rust 1.93.0, Node 24.x, and
+Deno 2.1.4. The `wasm-pack` version is pinned in the build too but is kept out
+of the tag to keep it short — it tracks the Rust toolchain and is listed in
+[`scripts/deploy_docker.sh`](scripts/deploy_docker.sh). The same build is also
+published as `latest`.
+
+### Building and publishing
+
+The pinned versions live at the top of
+[`scripts/deploy_docker.sh`](scripts/deploy_docker.sh) as the single source of
+truth — they are passed into the [`Dockerfile`](Dockerfile) as build args and
+baked into the tag. To cut a new base image, bump the versions in that script
+and run (after `docker login`):
+
+```bash
+./scripts/deploy_docker.sh
+```
+
+This builds all platforms and pushes the version tag and `latest`. To build
+locally without pushing (single platform, loaded into your daemon):
+
+```bash
+PUSH=false ./scripts/deploy_docker.sh
+```
+
+### Using it to build and deploy a saps server
+
+The base image already ships everything a saps build needs — the pinned Rust
+toolchain (plus the `wasm32-unknown-unknown` target and `wasm-pack`), Node with
+`corepack`/`pnpm` enabled, and Deno. Your server's `Dockerfile` only has to
+`FROM` it, build the frontend, then compile the binary with the `embed` feature
+so the frontend is baked in (see
+[Embedding and serving a frontend](#embedding-and-serving-a-frontend)).
+
+A multi-stage build that produces a small runtime image looks like this:
+
+```dockerfile
+# ---- Build stage: use the saps base image (pin the tag you want) ----
+FROM maxwellflitton/saps-base:r1.93.0-n24-d2.1.4 AS build
+WORKDIR /app
+
+# Build the Svelte frontend first → emits frontend/web/public, which the
+# `embed` feature compiles into the binary.
+COPY frontend/web/package.json frontend/web/package-lock.json frontend/web/
+RUN cd frontend/web && npm ci
+COPY . .
+RUN cd frontend/web && npm run build
+
+# Compile the server with the frontend embedded.
+RUN cargo build --release --features embed
+
+# ---- Runtime stage: just the binary + its shared libs ----
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Replace `your-server` with your crate's package name (the binary in target/release).
+COPY --from=build /app/target/release/your-server /usr/local/bin/your-server
+
+EXPOSE 3000
+CMD ["your-server"]
+```
+
+Build and run it locally:
+
+```bash
+docker build -t your-server:latest .
+docker run --rm -p 3000:3000 \
+  -e DATABASE_URL="postgres://user:pass@host:5432/db" \
+  your-server:latest
+```
+
+To deploy, tag the image for your registry and push:
+
+```bash
+docker tag your-server:latest <registry>/your-org/your-server:latest
+docker push <registry>/your-org/your-server:latest
+```
+
+> [!TIP]
+> Because the base image is built for both `linux/amd64` and `linux/arm64`, you
+> can build and push your server for both in one go with the same `buildx`
+> approach used in [`scripts/deploy_docker.sh`](scripts/deploy_docker.sh):
+> `docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/your-org/your-server:latest --push .`
+
+Pin the base image tag (rather than `latest`) in your server's `Dockerfile` so
+your builds are reproducible — the [tag scheme](#tag-scheme) above tells you
+exactly which Rust, Node, and Deno versions you are pinning to.
 
 ## Roadmap
 

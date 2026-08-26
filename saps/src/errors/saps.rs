@@ -207,3 +207,65 @@ impl From<std::io::Error> for SapsError {
         SapsError::unknown(value.to_string())
     }
 }
+
+impl From<crate::errors::file::FileError> for SapsError {
+    /// Lifts a file failure into a response error, preserving the inner message.
+    ///
+    /// The message is carried through verbatim rather than reformatted, because callers
+    /// (and their integration tests) rely on the exact backend text — for example the OS
+    /// `"No such file or directory (os error 2)"` a missing-file read produces, which the
+    /// `FileError` `Display` would otherwise wrap in its own prefix.
+    ///
+    /// An ill-formed path is a client mistake, so it maps to `bad_request`; the IO,
+    /// mem-file, and graph variants are internal failures and map to `unknown`.
+    /// Status-specific outcomes (not-found, conflict) are raised by the caller's own
+    /// existence and collision checks, not here.
+    fn from(error: crate::errors::file::FileError) -> Self {
+        use crate::errors::file::FileError;
+        match error {
+            FileError::Io { message, .. } => SapsError::unknown(message),
+            FileError::Path { message, .. } => SapsError::bad_request(message),
+            FileError::MemFile { message, .. } => SapsError::unknown(message),
+            FileError::Graph { message } => SapsError::unknown(message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_error_conversion_tests {
+    use super::*;
+    use crate::errors::file::FileError;
+
+    #[test]
+    fn test_io_error_preserves_the_inner_message() {
+        let mapped = SapsError::from(FileError::Io {
+            path: "x".into(),
+            message: "No such file or directory (os error 2)".into(),
+        });
+        assert_eq!(mapped.message, "No such file or directory (os error 2)");
+        assert_eq!(mapped.status, SapsErrorStatus::Unknown);
+    }
+
+    #[test]
+    fn test_path_error_maps_to_bad_request() {
+        let mapped =
+            SapsError::from(FileError::Path { path: "x".into(), message: "ill-formed".into() });
+        assert_eq!(mapped.message, "ill-formed");
+        assert_eq!(mapped.status, SapsErrorStatus::BadRequest);
+    }
+
+    #[test]
+    fn test_mem_file_error_maps_to_unknown() {
+        let mapped =
+            SapsError::from(FileError::MemFile { path: "x".into(), message: "buffer gone".into() });
+        assert_eq!(mapped.message, "buffer gone");
+        assert_eq!(mapped.status, SapsErrorStatus::Unknown);
+    }
+
+    #[test]
+    fn test_graph_error_maps_to_unknown() {
+        let mapped = SapsError::from(FileError::Graph { message: "cycle".into() });
+        assert_eq!(mapped.message, "cycle");
+        assert_eq!(mapped.status, SapsErrorStatus::Unknown);
+    }
+}
