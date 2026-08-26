@@ -1,6 +1,11 @@
 extern crate self as saps;
 
 pub mod errors;
+/// Shared pure-data types. Baseline surface — no feature required.
+pub mod kernel;
+
+#[cfg(feature = "files")]
+pub mod files;
 
 #[cfg(feature = "server")]
 pub mod auth;

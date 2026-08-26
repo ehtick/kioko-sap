@@ -1,6 +1,6 @@
 [package]
 name = "saps"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 description = "Core library for the SAP framework"
 license = "MIT"
@@ -41,6 +41,17 @@ saps-background-task = { version = "0.1.1", optional = true }
 # open api
 aide = { workspace = true, optional = true }
 
+# files (gated by the `files` feature family)
+yrs = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+
+# browser support. `wasm-bindgen` is its own feature because the `kernel` types
+# export to JS independently of whether the `files` IndexedDB engine is in play.
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+
 [features]
 default = ["server"]
 embedded_postgres = ["dep:postgresql_embedded", "dep:saps-db-embedded-pool-macro"]
@@ -67,7 +78,43 @@ server = [
 auth-tracing = []
 openapi = ["dep:aide"]
 
+# Exports the `kernel` types to JavaScript via `wasm-bindgen`. Independent of
+# `files` so a browser build can name the shared data types without pulling the
+# file IO layer in.
+wasm = ["dep:wasm-bindgen"]
+
+# The `files` module: typed paths, IO traits, storage engines, and the
+# collaborative in-memory buffers. Native disk and in-memory engines only.
+files = ["dep:yrs", "dep:tracing"]
+# Adds the redb-backed key-value engine.
+files-kv = ["files", "dep:redb"]
+# Adds the browser IndexedDB engine. Browser-only: the modules it enables are
+# additionally gated on `target_arch = "wasm32"`.
+files-indexed-db = [
+    "files",
+    "wasm",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:wasm-bindgen-futures",
+]
+
 [dev-dependencies]
+# `futures::executor::block_on` drives the async engines' tests from a sync test
+# fn. Wasm-safe to compile (those tests never run under the wasm harness), so it
+# is not target-gated.
+futures = { workspace = true }
+
+# The server and disk-backed tests are native-only. They are target-gated because
+# a `--target wasm32-unknown-unknown` test build pulls every dev-dependency
+# regardless of feature, and tokio's native reactor (mio) does not compile there.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 http-body-util = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
+tempfile = { workspace = true }
+
+# The IndexedDB tests only run in a browser, so their harness is a wasm-only dev
+# dep and never lands in a host build.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+getrandom_wasm = { workspace = true }
