@@ -102,7 +102,7 @@ cron = "0.16.0"
 postgresql_embedded = { version = "0.20.2", features = ["tokio"] }
 
 # open API
-aide = { version = "0.15.1", features = ["axum", "axum-json", "macros"] }
+aide = { version = "0.16.0-alpha.4", features = ["axum", "axum-json", "macros"] }
 
 # files: collaborative (CRDT) text buffer used by the mem-file layer
 yrs = "0.21"
