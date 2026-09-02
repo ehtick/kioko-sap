@@ -38,6 +38,11 @@
 //!
 //! The layer is a no-op for requests where no rotation occurred, so it is safe
 //! to apply broadly — even on routes that don't use `HeaderToken` at all.
+//! Only tokens using the default
+//! [`AutoRefresh`](crate::auth::token::refresh_policy::AutoRefresh) policy
+//! ever write to the slot; a
+//! [`NonRefreshToken`](crate::auth::token::header_token::NonRefreshToken)
+//! never rotates, so the layer is always a no-op for those.
 
 use crate::auth::auth_trace;
 use crate::auth::token::header_token::UpdatedAuthCookie;

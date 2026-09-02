@@ -1,11 +1,25 @@
-//! Y-free core of the `HeaderToken` extractor.
+//! Y-free (and M-free) core of the `HeaderToken` extractor.
 //!
 //! This module owns the heavy lifting of the auth flow — token extraction,
-//! JWT decode, DB ping, rotation handling — generic only over the config
-//! provider `X`, the role enum `R`, and the DB pool `Z`. The role-check
-//! strategy `Y` lives one level up in [`HeaderToken::from_request_parts`]
-//! so the body here compiles once per `(X, R, Z)` regardless of how many
-//! `Y` strategies the consumer crate uses.
+//! JWT decode, session lookup / ping, rotation handling — generic only over
+//! the config provider `X`, the role enum `R`, and the DB pool `Z`. The
+//! role-check strategy `Y` lives one level up in
+//! [`HeaderToken::from_request_parts`], and the refresh policy `M` is passed
+//! in as a plain [`RefreshMode`] value, so the body here compiles once per
+//! `(X, R, Z)` regardless of how many `Y` strategies or refresh policies the
+//! consumer crate uses.
+//!
+//! # Modes
+//!
+//! - [`RefreshMode::Auto`] — call `saps.ping`, which bumps `last_interacted`,
+//!   deletes idle sessions, and rotates the UUID after 5 minutes. On rotation
+//!   a fresh JWT is encoded and handed to the [`CookieSlot`]. The JWT's own
+//!   `time_expire` is **not** checked.
+//! - [`RefreshMode::Never`] — reject the request with `403 Forbidden` if the
+//!   JWT's `time_expire` has passed, then do a read-only `get_auth_session`
+//!   lookup. No ping, no rotation, no cookie.
+//!
+//! In both modes a missing/invalid token or a missing session is `401`.
 //!
 //! [`HeaderToken::from_request_parts`]: crate::auth::token::header_token::HeaderToken
 
@@ -15,7 +29,10 @@ use chrono::{DateTime, Utc};
 use crate::{
     auth::{
         auth_trace,
-        dal::{model::AuthSession, tx_definitions::PingAuthSession},
+        dal::{
+            model::AuthSession,
+            tx_definitions::{GetAuthSession, PingAuthSession},
+        },
         middleware::CookieSlot,
         token::{
             checks::UserRole,
@@ -27,6 +44,7 @@ use crate::{
                 extract_token_from_header::extract_token_from_header,
                 jwt_claims::JwtClaims,
             },
+            refresh_policy::RefreshMode,
         },
     },
     config::GetConfigVariable,
@@ -50,7 +68,7 @@ pub struct RawAuthExtraction<R: UserRole> {
     /// rotation, otherwise carried over from the inbound JWT.
     pub time_expire: DateTime<Utc>,
     /// The previous UUID if a rotation occurred during this request,
-    /// otherwise `None`.
+    /// otherwise `None`. Always `None` under [`RefreshMode::Never`].
     pub old_uuid: Option<String>,
 }
 
@@ -58,17 +76,33 @@ pub struct RawAuthExtraction<R: UserRole> {
 ///
 /// 1. Locate the JWT in cookies / `token` header / Authorization bearer.
 /// 2. Decode and verify the JWT.
-/// 3. Ping `saps.ping(10, unique_id)` to keep the session alive and detect
-///    rotation.
-/// 4. On rotation: re-encode a refreshed JWT, build the `Set-Cookie`
-///    payload, and stash it in the request's [`CookieSlot`] (if installed).
+/// 3. Depending on `mode`:
+///    - [`RefreshMode::Never`]: reject with `403 Forbidden` if the JWT's
+///      `time_expire` has passed, then load the session read-only via
+///      `get_auth_session` and return early — no ping, no rotation, no
+///      cookie.
+///    - [`RefreshMode::Auto`]: ping `saps.ping(10, unique_id)` to keep the
+///      session alive and detect rotation.
+/// 4. (Auto only) On rotation: re-encode a refreshed JWT, build the
+///    `Set-Cookie` payload, and stash it in the request's [`CookieSlot`]
+///    (if installed).
 ///
 /// The role check is intentionally *not* performed here — it lives in the
 /// outer `from_request_parts` shim and is the only place `Y` is consulted.
-/// Keeping `Y` out of this function means the body compiles once per
-/// `(X, R, Z)` rather than once per `(X, Y, R, Z)`.
+/// The refresh policy `M` is likewise reduced to the runtime `mode` value
+/// before this function is called. Keeping both out of the generics means
+/// the body compiles once per `(X, R, Z)` rather than once per
+/// `(X, Y, R, Z, M)`.
+///
+/// # Errors
+///
+/// - `401 Unauthorized` — no JWT found, signature invalid, or session not
+///   present in the database (both modes).
+/// - `403 Forbidden` — `mode == Never` and the JWT's `time_expire` has
+///   passed.
 pub async fn run_auth_extraction<X, R, Z>(
     parts: &mut Parts,
+    mode: RefreshMode,
 ) -> Result<RawAuthExtraction<R>, SapsError>
 where
     X: GetConfigVariable + Send + Sync,
@@ -86,6 +120,7 @@ where
     auth_trace!(
         method = %method,
         uri = %uri,
+        mode = ?mode,
         "run_auth_extraction — auth flow start",
     );
 
@@ -160,9 +195,68 @@ where
         uri = %uri,
         session_id = %existing_id,
         time_expire = %claims.time_expire,
-        "run_auth_extraction — JWT decoded, pinging session",
+        mode = ?mode,
+        "run_auth_extraction — JWT decoded, looking up session",
     );
 
+    // Non-refreshing (OAuth-style) mode: the JWT's own expiry is the lifetime
+    // of the credential. Enforce it up front (403), then load the session
+    // read-only. Nothing below this block runs for `Never`.
+    if mode == RefreshMode::Never {
+        if Utc::now() > claims.time_expire {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %existing_id,
+                time_expire = %claims.time_expire,
+                "run_auth_extraction — [no-refresh] JWT expired, rejecting with 403",
+            );
+            return Err(SapsError::forbidden("Token has expired"));
+        }
+
+        let session = AuthPostGresDescriptor::<Z>::get_auth_session::<R>(&claims.unique_id)
+            .await
+            .map_err(|e| {
+                auth_trace!(
+                    method = %method,
+                    uri = %uri,
+                    session_id = %existing_id,
+                    error = %e,
+                    "run_auth_extraction — [no-refresh] get_auth_session DB call failed",
+                );
+                e
+            })?;
+        let Some(session) = session else {
+            auth_trace!(
+                method = %method,
+                uri = %uri,
+                session_id = %existing_id,
+                "run_auth_extraction — [no-refresh] session not present in DB",
+            );
+            return Err(SapsError::unauthorized("session not present"));
+        };
+
+        auth_trace!(
+            method = %method,
+            uri = %uri,
+            session_id = %existing_id,
+            returned_session_id = %session.id,
+            role = %session.role.to_string(),
+            date_created = %session.date_created,
+            last_interacted = %session.last_interacted,
+            meta = ?session.meta,
+            "run_auth_extraction — [no-refresh] session loaded, no ping/rotation",
+        );
+
+        return Ok(RawAuthExtraction {
+            session,
+            unique_id: claims.unique_id,
+            time_expire: claims.time_expire,
+            old_uuid: None,
+        });
+    }
+
+    // Auto-refresh mode from here on.
     // Ping the session to keep it alive and check if it still exists.
     let session = match AuthPostGresDescriptor::<Z>::ping_auth_session::<R>(
         10,

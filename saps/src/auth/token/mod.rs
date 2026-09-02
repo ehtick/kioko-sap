@@ -3,3 +3,4 @@ pub mod cookies;
 pub mod header_token;
 pub mod login;
 pub mod helper_methods;
+pub mod refresh_policy;

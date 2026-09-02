@@ -18,15 +18,30 @@
 //! 4. **`Sec-WebSocket-Protocol` header** — `bearer, <JWT>` subprotocol (for WebSocket
 //!    connections that cannot set custom headers).
 //!
-//! # Session refresh
+//! # Refresh policies
 //!
-//! The database stored procedure (`saps.ping`) may regenerate the session UUID when the
-//! session's `date_created` is older than 5 minutes. When this happens, the extractor:
+//! The fifth generic parameter `M` (a [`TokenRefreshPolicy`]) decides what happens to
+//! the session row and to the JWT's own expiry on every request. It defaults to
+//! [`AutoRefresh`], so `HeaderToken<X, Y, R, Z>` keeps the classic behaviour. Two
+//! aliases save you from spelling `M`:
+//!
+//! | Alias | Policy | Session row | JWT `time_expire` | Rotation / `Set-Cookie` |
+//! |-------|--------|-------------|-------------------|-------------------------|
+//! | [`RefreshToken<X, Y, R, Z>`](RefreshToken) | [`AutoRefresh`] (default) | `saps.ping` — bumps `last_interacted`, deletes idle sessions, rotates the UUID after 5 minutes | ignored | yes |
+//! | [`NonRefreshToken<X, Y, R, Z>`](NonRefreshToken) | [`NoRefresh`] | read-only `get_auth_session` | enforced — past expiry is **403 Forbidden** | never |
+//!
+//! Under `AutoRefresh`, when `saps.ping` regenerates the session UUID (because the
+//! session's `date_created` is older than 5 minutes) the extractor:
 //!
 //! 1. Updates the token's `unique_id` to the new UUID.
 //! 2. Re-encodes a fresh JWT.
-//! 3. Inserts an [`UpdatedAuthCookie`] into the request extensions so that downstream
-//!    middleware or handlers can set the updated `Set-Cookie` header on the response.
+//! 3. Hands an [`UpdatedAuthCookie`] to the [`CookieSlot`](crate::auth::middleware::CookieSlot)
+//!    so the [`attach_refreshed_cookie`](crate::auth::middleware::attach_refreshed_cookie)
+//!    layer can set the updated `Set-Cookie` header on the response.
+//!
+//! Under `NoRefresh` none of that happens: the token is valid for exactly
+//! `TOKEN_EXPIRE_MINS` and then stops working (OAuth-style). Obtaining a new token is
+//! the client's job.
 //!
 //! # Generic parameters
 //!
@@ -36,11 +51,12 @@
 //! | `Y` | [`CheckUserRole`] | Role-check strategy — controls which roles are permitted (e.g. `AdminRoleCheck`) |
 //! | `R` | [`UserRole`] | The concrete role enum type (e.g. `MyRole`) |
 //! | `Z` | [`YieldPostGresPool`] | Provides the PostgreSQL connection pool for session operations |
+//! | `M` | [`TokenRefreshPolicy`] | Refresh policy — [`AutoRefresh`] (default) or [`NoRefresh`] |
 //!
 //! # Example
 //!
 //! ```
-//! use saps::auth::token::header_token::HeaderToken;
+//! use saps::auth::token::header_token::{HeaderToken, NonRefreshToken};
 //! use saps::auth::token::checks::{
 //!     AdminRoleCheck, NoRoleCheck, DefaultRole,
 //! };
@@ -52,6 +68,9 @@
 //! // In production, replace EnvConfig/MockDeadPostGresPool with your
 //! // own config provider and live pool.
 //! type AdminToken = HeaderToken<EnvConfig, AdminRoleCheck, DefaultRole, MockDeadPostGresPool>;
+//!
+//! // The same, but OAuth-style: never rotates, expired JWT is a 403.
+//! type AdminApiToken = NonRefreshToken<EnvConfig, AdminRoleCheck, DefaultRole, MockDeadPostGresPool>;
 //!
 //! // Manually create and encode a token (typically done via the login module).
 //! // Here we set the required env vars so the example runs.
@@ -87,6 +106,7 @@ use crate::{
                 },
                 run_auth_extraction::run_auth_extraction,
             },
+            refresh_policy::{AutoRefresh, NoRefresh, TokenRefreshPolicy},
         },
     },
     config::GetConfigVariable,
@@ -101,6 +121,9 @@ use uuid::Uuid;
 
 /// A `Set-Cookie` value produced by the extractor when the stored procedure
 /// regenerates the session UUID (because `date_created` was older than 5 minutes).
+///
+/// Only ever produced under the [`AutoRefresh`] policy — a
+/// [`NonRefreshToken`] never rotates and never writes one of these.
 ///
 /// The extractor writes one of these into the
 /// [`CookieSlot`](crate::auth::middleware::CookieSlot) installed by
@@ -136,12 +159,19 @@ pub struct UpdatedAuthCookie(pub String);
 /// | `role_handle` | No | Phantom marker for the role-check strategy `Y` |
 /// | `db_handle` | No | Phantom marker for the database pool provider `Z` |
 /// | `role` | No | Phantom marker for the concrete role enum `R` |
+/// | `refresh_handle` | No | Phantom marker for the refresh policy `M` |
 /// | `auth_session` | No | The full [`AuthSession`] loaded from the DB during extraction |
 /// | `old_uuid` | No | The previous UUID when the extractor rotated the session, otherwise `None` |
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "openapi", derive(aide::OperationIo))]
 #[cfg_attr(feature = "openapi", aide(input))]
-pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool> {
+pub struct HeaderToken<
+    X: GetConfigVariable,
+    Y: CheckUserRole,
+    R: UserRole,
+    Z: YieldPostGresPool,
+    M: TokenRefreshPolicy = AutoRefresh,
+> {
     /// The UUID that links this token to its `saps.auth_sessions` row.
     /// Stored as a string in the JWT payload.
     pub unique_id: String,
@@ -156,6 +186,8 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     pub db_handle: PhantomData<Z>,
     /// Phantom marker for the concrete role enum type `R`.
     pub role: PhantomData<R>,
+    /// Phantom marker for the refresh policy type `M`.
+    pub refresh_handle: PhantomData<M>,
     /// The session row loaded from `saps.auth_sessions` during extraction.
     ///
     /// `None` for freshly created tokens; the [`FromRequestParts`] impl
@@ -171,9 +203,29 @@ pub struct HeaderToken<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: Y
     pub old_uuid: Option<String>,
 }
 
+/// A [`HeaderToken`] with the default [`AutoRefresh`] policy.
+///
+/// Identical to `HeaderToken<X, Y, R, Z>`; exists so the two policies read
+/// symmetrically at call sites (`RefreshToken` vs [`NonRefreshToken`]).
+/// Pings the session on every request, rotates the UUID after 5 minutes, and
+/// re-issues the cookie through
+/// [`attach_refreshed_cookie`](crate::auth::middleware::attach_refreshed_cookie).
+pub type RefreshToken<X, Y, R, Z> = HeaderToken<X, Y, R, Z, AutoRefresh>;
 
-impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
-    HeaderToken<X, Y, R, Z>
+/// A [`HeaderToken`] with the [`NoRefresh`] policy (OAuth-style).
+///
+/// Never rotates the session, never bumps `last_interacted`, never writes a
+/// cookie. A JWT past its `time_expire` is rejected with `403 Forbidden`;
+/// every other auth failure is `401 Unauthorized` as usual.
+pub type NonRefreshToken<X, Y, R, Z> = HeaderToken<X, Y, R, Z, NoRefresh>;
+
+impl<X, Y, R, Z, M> HeaderToken<X, Y, R, Z, M>
+where
+    X: GetConfigVariable,
+    Y: CheckUserRole,
+    R: UserRole,
+    Z: YieldPostGresPool,
+    M: TokenRefreshPolicy,
 {
     /// Creates a new token with a random UUID and an expiry derived from config.
     ///
@@ -202,6 +254,7 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
             role_handle: PhantomData,
             db_handle: PhantomData,
             role: PhantomData,
+            refresh_handle: PhantomData,
             auth_session: None,
             old_uuid: None,
         })
@@ -815,6 +868,7 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
             role_handle: PhantomData,
             db_handle: PhantomData,
             role: PhantomData,
+            refresh_handle: PhantomData,
             auth_session: None,
             old_uuid: None,
         })
@@ -830,27 +884,40 @@ impl<X: GetConfigVariable, Y: CheckUserRole, R: UserRole, Z: YieldPostGresPool>
 /// 1. **Extract** the JWT from cookies, the `token` header, or the `Authorization` /
 ///    `Sec-WebSocket-Protocol` header (in that order).
 /// 2. **Decode** the JWT and verify its HS256 signature.
-/// 3. **Ping** the database session via `saps.ping(10, session_id)`. If the session
-///    does not exist or has been inactive for more than 10 minutes, the request is
-///    rejected with `401 Unauthorized`.
+/// 3. **Load the session** — this step depends on the refresh policy `M`:
+///    - [`AutoRefresh`] (default): **ping** the database session via
+///      `saps.ping(10, session_id)`. If the session does not exist or has been
+///      inactive for more than 10 minutes, the request is rejected with
+///      `401 Unauthorized`. The JWT's `time_expire` is not checked.
+///    - [`NoRefresh`]: if the JWT's `time_expire` has passed, reject with
+///      `403 Forbidden`. Otherwise load the session **read-only** via
+///      `get_auth_session`; a missing session is `401 Unauthorized`.
 /// 4. **Check the role** by calling `Y::check_user_role(&session.role)`. If the
 ///    session's role does not satisfy the check strategy `Y`, the request is rejected.
-/// 5. **Refresh the session** if the stored procedure regenerated the UUID (because
-///    `date_created` was older than 5 minutes). When this happens, a new JWT is encoded
-///    and an [`UpdatedAuthCookie`] is inserted into the request extensions.
+/// 5. **Refresh the session** (`AutoRefresh` only) if the stored procedure regenerated
+///    the UUID (because `date_created` was older than 5 minutes). When this happens, a
+///    new JWT is encoded and an [`UpdatedAuthCookie`] is handed to the response layer.
 /// 6. **Populate metadata** from the session's `meta` JSONB column.
 ///
 /// # Rejection
 ///
-/// Returns [`SapsError`] (which implements `IntoResponse`) with status `401 Unauthorized`
-/// if any step fails.
-impl<S, X, Y, R, Z> FromRequestParts<S> for HeaderToken<X, Y, R, Z>
+/// Returns [`SapsError`] (which implements `IntoResponse`):
+///
+/// | Failure | `AutoRefresh` | `NoRefresh` |
+/// |---------|---------------|-------------|
+/// | No JWT in any supported location | 401 | 401 |
+/// | Bad signature / undecodable JWT | 401 | 401 |
+/// | JWT past `time_expire` | not checked | **403** |
+/// | Session missing (or idle-deleted) | 401 | 401 |
+/// | Role check fails | 401 | 401 |
+impl<S, X, Y, R, Z, M> FromRequestParts<S> for HeaderToken<X, Y, R, Z, M>
 where
     S: Send + Sync,
     X: GetConfigVariable + Send + Sync,
     Y: CheckUserRole + Send + Sync,
     Z: YieldPostGresPool + Send + Sync,
     R: UserRole + Send + Sync,
+    M: TokenRefreshPolicy + Send + Sync,
 {
     type Rejection = SapsError;
 
@@ -870,9 +937,10 @@ where
     /// A fully validated `HeaderToken` with `meta` populated from the database, or
     /// a [`SapsError`] rejection.
     // Thin shim over `run_auth_extraction`. The heavy lifting — token
-    // extraction, JWT decode, DB ping, rotation handling — lives in
+    // extraction, JWT decode, DB lookup/ping, rotation handling — lives in
     // `run_auth_extraction` and is generic only over `(X, R, Z)`. The role
-    // check is the only `Y`-dependent step and stays here.
+    // check is the only `Y`-dependent step and stays here; the refresh
+    // policy `M` is reduced to a runtime `RefreshMode` value before the call.
     //
     // The boxed return type prevents the (small) wrapping async state
     // machine from being inlined into every handler call site.
@@ -882,7 +950,7 @@ where
         _state: &'s S,
     ) -> Pin<Box<dyn Future<Output = Result<Self, Self::Rejection>> + Send + 'p>> {
         Box::pin(async move {
-            let raw = run_auth_extraction::<X, R, Z>(parts).await?;
+            let raw = run_auth_extraction::<X, R, Z>(parts, M::MODE).await?;
 
             // Verify the session's role satisfies the check strategy Y.
             // This is the only place `Y` is consulted in the whole flow.
@@ -899,6 +967,7 @@ where
                 session_id = %raw.unique_id,
                 role = %raw.session.role.to_string(),
                 rotated = raw.old_uuid.is_some(),
+                mode = ?M::MODE,
                 "from_request_parts — auth flow complete",
             );
 
@@ -909,6 +978,7 @@ where
                 role_handle: PhantomData,
                 db_handle: PhantomData,
                 role: PhantomData,
+                refresh_handle: PhantomData,
                 auth_session: Some(raw.session),
                 old_uuid: raw.old_uuid,
             })
@@ -919,7 +989,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::dal::tx_definitions::CreateAuthSession;
+    use crate::auth::dal::tx_definitions::{CreateAuthSession, GetAuthSession};
     use crate::auth::token::checks::{
         AdminRoleCheck, CustomerRoleCheck, ExactAdminRoleCheck, NoRoleCheck, SuperAdminRoleCheck,
     };
@@ -1537,5 +1607,243 @@ mod tests {
         let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body_json["old_uuid"], serde_json::Value::Null);
+    }
+
+    // ===== Refresh-policy tests (NonRefreshToken / RefreshToken aliases) =====
+
+    /// A `NonRefreshToken` whose JWT is past `time_expire` is rejected with
+    /// 403 Forbidden — even though a matching session exists in the DB
+    /// (proves the expiry check runs before the lookup).
+    #[saps::db_test]
+    async fn test_no_refresh_rejects_expired_jwt_with_403() {
+        type Tk = NonRefreshToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+
+        let mut token: Tk = HeaderToken::new::<TestRole>().unwrap();
+        let mut session = AuthSession::new(TestRole::Admin);
+        session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
+        AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("failed to create session");
+
+        token.time_expire = Utc::now() - chrono::Duration::minutes(1);
+
+        let app = Router::new().route("/", get(handler));
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, Bytes::from_static(b"\"Token has expired\""));
+    }
+
+    /// A `NonRefreshToken` never rotates: even with `date_created` backdated
+    /// past the 5-minute rotation window, the request succeeds, no
+    /// `Set-Cookie` is attached, the handler sees the original UUID with
+    /// `old_uuid` unset, and the DB row keeps its original id.
+    #[saps::db_test]
+    async fn test_no_refresh_skips_rotation_and_set_cookie() {
+        use crate::auth::middleware::attach_refreshed_cookie;
+        use axum::middleware::from_fn;
+
+        type Tk = NonRefreshToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({
+                "unique_id": tok.unique_id,
+                "old_uuid": tok.old_uuid,
+            }))
+        }
+
+        let token: Tk = HeaderToken::new::<TestRole>().unwrap();
+        let original_uuid = token.unique_id.clone();
+        let mut session = AuthSession::new(TestRole::Admin);
+        session.id = uuid::Uuid::parse_str(&original_uuid).unwrap();
+        AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("failed to create session");
+
+        // Backdate so an AutoRefresh ping WOULD rotate.
+        saps::sqlx::query("UPDATE saps.auth_sessions SET date_created = NOW() - INTERVAL '6 minutes' WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&original_uuid).unwrap())
+            .execute(pool)
+            .await
+            .expect("failed to backdate session");
+
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(from_fn(attach_refreshed_cookie));
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+            "NonRefreshToken must never attach a Set-Cookie",
+        );
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body_json["unique_id"],
+            serde_json::Value::String(original_uuid.clone())
+        );
+        assert_eq!(body_json["old_uuid"], serde_json::Value::Null);
+
+        // The DB row was not rotated.
+        let row = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(&original_uuid)
+            .await
+            .expect("lookup")
+            .expect("session should still exist under its original id");
+        assert_eq!(row.id.to_string(), original_uuid);
+    }
+
+    /// A `NonRefreshToken` whose session row does not exist is 401, like the
+    /// AutoRefresh path.
+    #[saps::db_test]
+    async fn test_no_refresh_missing_session_is_401() {
+        type Tk = NonRefreshToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+
+        // No session is created for this token.
+        let token: Tk = HeaderToken::new::<TestRole>().unwrap();
+
+        let app = Router::new().route("/", get(handler));
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, Bytes::from_static(b"\"session not present\""));
+    }
+
+    /// A `NonRefreshToken` does a read-only lookup: `last_interacted` is left
+    /// exactly as it was.
+    #[saps::db_test]
+    async fn test_no_refresh_does_not_bump_last_interacted() {
+        type Tk = NonRefreshToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+
+        let token: Tk = HeaderToken::new::<TestRole>().unwrap();
+        let id = token.unique_id.clone();
+        let mut session = AuthSession::new(TestRole::Admin);
+        session.id = uuid::Uuid::parse_str(&id).unwrap();
+        AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("failed to create session");
+
+        saps::sqlx::query("UPDATE saps.auth_sessions SET last_interacted = NOW() - INTERVAL '3 minutes' WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&id).unwrap())
+            .execute(pool)
+            .await
+            .expect("failed to backdate last_interacted");
+
+        let before = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(&id)
+            .await
+            .expect("lookup")
+            .expect("session");
+
+        let app = Router::new().route("/", get(handler));
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, req).await.0, StatusCode::OK);
+
+        let after = AuthPostGresDescriptor::<TestDbHandle>::get_auth_session::<TestRole>(&id)
+            .await
+            .expect("lookup")
+            .expect("session");
+        assert_eq!(
+            before.last_interacted, after.last_interacted,
+            "NonRefreshToken must not bump last_interacted"
+        );
+    }
+
+    /// Documents legacy behaviour: the default (AutoRefresh) token does NOT
+    /// enforce the JWT's `time_expire` — session liveness is governed by
+    /// `saps.ping` alone.
+    #[saps::db_test]
+    async fn test_auto_refresh_ignores_expired_jwt() {
+        type Tk = HeaderToken<FakeConfig, NoRoleCheck, TestRole, TestDbHandle>;
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+
+        let mut token: Tk = HeaderToken::new::<TestRole>().unwrap();
+        let mut session = AuthSession::new(TestRole::Admin);
+        session.id = uuid::Uuid::parse_str(&token.unique_id).unwrap();
+        AuthPostGresDescriptor::<TestDbHandle>::create_auth_session(session)
+            .await
+            .expect("failed to create session");
+
+        token.time_expire = Utc::now() - chrono::Duration::minutes(1);
+
+        let app = Router::new().route("/", get(handler));
+        let req = Request::builder()
+            .uri("/")
+            .header("token", token.encode().unwrap())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    }
+
+    /// A `NonRefreshToken` with no token at all is 401 before any DB access.
+    #[tokio::test]
+    async fn test_no_refresh_missing_token_is_401() {
+        type Tk = NonRefreshToken<FakeConfig, NoRoleCheck, TestRole, MockDeadPostGresPool>;
+        async fn handler(tok: Tk) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+
+        let app = Router::new().route("/", get(handler));
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body,
+            Bytes::from_static(b"\"Missing Authorization header\"")
+        );
+    }
+
+    /// Both aliases are usable as handler parameters, and `RefreshToken` is
+    /// the same type as the un-suffixed `HeaderToken<X, Y, R, Z>`.
+    #[tokio::test]
+    async fn test_aliases_usable_as_handler_params() {
+        type Rt = RefreshToken<FakeConfig, NoRoleCheck, TestRole, MockDeadPostGresPool>;
+        type Nrt = NonRefreshToken<FakeConfig, NoRoleCheck, TestRole, MockDeadPostGresPool>;
+
+        async fn refresh_handler(tok: Rt) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+        async fn non_refresh_handler(tok: Nrt) -> impl IntoResponse {
+            Json(json!({ "unique_id": tok.unique_id }))
+        }
+
+        // Compile-time identity: RefreshToken<..> == HeaderToken<..> (default M).
+        let _: TkNo = Rt::new::<TestRole>().unwrap();
+
+        let app = Router::new()
+            .route("/refresh", get(refresh_handler))
+            .route("/non-refresh", get(non_refresh_handler));
+
+        for path in ["/refresh", "/non-refresh"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let (status, _) = send(&app, req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        }
     }
 }

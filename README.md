@@ -381,7 +381,7 @@ Saps ships with cookie-based auth sessions backed by a row in `saps.auth_session
 
 1. After a user logs in, you create an `AuthSession` row with whatever you want to remember about that session in its `meta` JSONB column (e.g. `user_id`, `user_role`, the department they're scoped to).
 2. You hand the user back a JWT whose `unique_id` is the session row's UUID, set as the `saps-token` cookie.
-3. On every subsequent request the `HeaderToken` extractor pulls the JWT, pings the session row (which extends `last_interacted` and rotates the UUID after 5 minutes of inactivity), and attaches the full `AuthSession` to the token before your handler runs.
+3. On every subsequent request the `HeaderToken` extractor pulls the JWT and, depending on its [refresh policy](#refresh-policies), either pings the session row (which extends `last_interacted` and rotates the UUID after 5 minutes) or does a read-only lookup, then attaches the full `AuthSession` to the token before your handler runs.
 4. Your handler reads typed meta values directly off the token — no extra DB round-trip — and can update meta atomically via the same token.
 
 Login and logout get their own examples later in the docs. This section assumes a session has already been created and focuses on what your handlers do with it.
@@ -392,11 +392,57 @@ Every request that uses a `HeaderToken` extractor goes through the following ins
 
 1. Extract the JWT from the `saps-token` cookie, the `token` header, or `Authorization: Bearer …` (in that order).
 2. Decode and verify the HS256 signature using `SECRET_KEY`.
-3. Call `saps.ping(10, session_id)`. This either bumps `last_interacted`, regenerates the session UUID once `date_created` is older than 5 minutes, or returns `NULL` for a session that's been idle for 10 minutes.
+3. Load the session. What happens here depends on the token's [refresh policy](#refresh-policies):
+   - **`RefreshToken` / plain `HeaderToken` (default)** — call `saps.ping(10, session_id)`. This either bumps `last_interacted`, regenerates the session UUID once `date_created` is older than 5 minutes, or returns `NULL` for a session that's been idle for 10 minutes.
+   - **`NonRefreshToken`** — reject with `403 Forbidden` if the JWT's `time_expire` has passed, otherwise do a read-only `get_auth_session` lookup. Nothing is written.
 4. Run the role check (e.g. `AdminRoleCheck`, `NoRoleCheck`) against the session's role.
 5. Stash the loaded `AuthSession` on the token and hand it to your handler.
 
 If step 3 rotated the UUID, the [middleware](#middleware) attaches a fresh `Set-Cookie` to the response automatically — your handler doesn't have to do anything special.
+
+### Refresh policies
+
+`HeaderToken` has a fifth, defaulted generic — `HeaderToken<X, Y, R, Z, M = AutoRefresh>` — that selects how the extractor treats the session row and the JWT's own expiry. You never need to spell `M`; use one of the two aliases from `saps::auth::token::header_token`:
+
+| | `RefreshToken<X, Y, R, Z>` (= `HeaderToken<X, Y, R, Z>`) | `NonRefreshToken<X, Y, R, Z>` |
+|---|---|---|
+| Policy marker | `AutoRefresh` (default) | `NoRefresh` |
+| DB call per request | `saps.ping` | `get_auth_session` (read-only) |
+| Bumps `last_interacted` | yes | no |
+| Idle sessions deleted by the extractor | yes, after 10 minutes | no |
+| Rotates the session UUID | yes, after 5 minutes | never |
+| Emits a refreshed `Set-Cookie` | yes, via the [middleware](#middleware) | never |
+| Enforces the JWT's `time_expire` | no | yes |
+| Expired JWT | still accepted (session ping decides) | `403 Forbidden` |
+
+`RefreshToken` is the classic cookie-session behaviour: the server keeps the session alive for as long as the client keeps talking to it. `NonRefreshToken` is the OAuth-style behaviour: the access token is valid for exactly `TOKEN_EXPIRE_MINS` and then stops working, and it is the client's job to obtain a new one (typically via a refresh-token endpoint you write).
+
+```rust
+use saps::auth::token::header_token::{HeaderToken, NonRefreshToken, RefreshToken};
+use saps::auth::token::checks::NoRoleCheck;
+
+// Classic behaviour — these two are the same type.
+async fn dashboard<X, R, Z>(token: HeaderToken<X, NoRoleCheck, R, Z>) { /* … */ }
+async fn dashboard_alias<X, R, Z>(token: RefreshToken<X, NoRoleCheck, R, Z>) { /* … */ }
+
+// OAuth-style: no rotation, expired JWT is a 403.
+async fn api_endpoint<X, R, Z>(token: NonRefreshToken<X, NoRoleCheck, R, Z>) { /* … */ }
+```
+
+Status codes are the same in both modes except for expiry:
+
+| Failure | `RefreshToken` | `NonRefreshToken` |
+|---|---|---|
+| No JWT in any supported location | 401 | 401 |
+| Bad signature / undecodable JWT | 401 | 401 |
+| JWT past `time_expire` | not checked | **403** |
+| Session missing (or idle-deleted) | 401 | 401 |
+| Role check fails | 401 | 401 |
+
+Two things to keep in mind with `NonRefreshToken`:
+
+- The extractor never calls `saps.ping`, so it never deletes idle sessions. A `NonRefreshToken` session's lifetime is bounded by the JWT's `TOKEN_EXPIRE_MINS`, not by inactivity — clean up rows yourself (e.g. on logout, or a background task) if you need them gone.
+- The read-only lookup matches on the current `id` only. `saps.ping` honours a rotated session's `old_id` for a 10-second grace window; `get_auth_session` does not. Don't point a `RefreshToken` and a `NonRefreshToken` at the same session unless the client reliably adopts the refreshed cookie.
 
 ### Reading session meta
 
@@ -603,7 +649,7 @@ let app = Router::new()
     .layer(from_fn(attach_refreshed_cookie));
 ```
 
-The layer installs a slot in the request extensions, the extractor writes the new cookie into that slot when a rotation happens, and the layer attaches the `Set-Cookie` to the response after the handler returns. It's a no-op when no rotation occurred, so it's safe to apply broadly — even on routes that don't use `HeaderToken`.
+The layer installs a slot in the request extensions, the extractor writes the new cookie into that slot when a rotation happens, and the layer attaches the `Set-Cookie` to the response after the handler returns. It's a no-op when no rotation occurred, so it's safe to apply broadly — even on routes that don't use `HeaderToken`. It is always a no-op for `NonRefreshToken`, which never rotates (see [Refresh policies](#refresh-policies)).
 
 ### Debug tracing
 
@@ -670,7 +716,7 @@ Failure paths emit the same shape with an `error` field — `JWT decode failed`,
 
 ### Role checks
 
-The second generic on `HeaderToken<X, Y, R, Z>` is the role-check strategy. Saps doesn't ship a fixed set of checks — you generate your own role enum and any number of check structs in one go with `construct_checks!`:
+The second generic on `HeaderToken<X, Y, R, Z>` is the role-check strategy (a fifth, defaulted generic selects the [refresh policy](#refresh-policies) and can be ignored here). Saps doesn't ship a fixed set of checks — you generate your own role enum and any number of check structs in one go with `construct_checks!`:
 
 ```rust
 use saps::construct_checks;
